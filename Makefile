@@ -36,10 +36,18 @@ SRCS := src/main.c src/wayland.c src/image.c src/openai.c src/ipc.c src/daemon.c
 OBJS := $(SRCS:.c=.o) $(PROTO_OBJS)
 
 BIN := background
+PREFIX ?= $(HOME)/.local
 
-.PHONY: all clean distclean run
+.PHONY: all clean distclean install uninstall
 
 all: $(BIN)
+
+install: $(BIN)
+	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
+	@echo "installed to $(DESTDIR)$(PREFIX)/bin/$(BIN)"
+
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

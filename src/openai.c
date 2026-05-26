@@ -5,8 +5,8 @@
 //   Content-Type: application/json
 //   Body (gpt-image-2):
 //     { "model":"gpt-image-2", "prompt":"…", "n":1,
-//       "size":"1536x1024", "quality":"medium",
-//       "response_format":"b64_json" }
+//       "size":"1536x1024", "quality":"medium" }
+//   gpt-image-* always return base64 and reject "response_format".
 //   Response:
 //     { "created":…, "data":[ { "b64_json":"…" } ] }
 
@@ -108,7 +108,8 @@ bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
     cJSON_AddNumberToObject(body, "n", 1);
     cJSON_AddStringToObject(body, "size", size);
     cJSON_AddStringToObject(body, "quality", quality);
-    cJSON_AddStringToObject(body, "response_format", "b64_json");
+    // Note: gpt-image-* models always return base64 and reject "response_format"
+    // (unlike the older dall-e models), so we don't send it.
     char *body_str = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
     if (!body_str) { LOG_ERR("openai: json print failed"); return false; }

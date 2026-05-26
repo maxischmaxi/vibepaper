@@ -58,17 +58,17 @@ Key design points:
 
 ### Source layout
 
-| File | Responsibility |
-|------|----------------|
-| `src/main.c`    | CLI parsing, client requests, daemon auto-spawn |
-| `src/daemon.c`  | Event loop, command dispatch, generation queue + worker |
+| File            | Responsibility                                             |
+| --------------- | ---------------------------------------------------------- |
+| `src/main.c`    | CLI parsing, client requests, daemon auto-spawn            |
+| `src/daemon.c`  | Event loop, command dispatch, generation queue + worker    |
 | `src/wayland.c` | Layer-shell surfaces, SHM buffer pool, crossfade, viewport |
-| `src/openai.c`  | OpenAI image API client (libcurl + cJSON + base64) |
-| `src/image.c`   | Decode / cover-fit / blit (stb) |
-| `src/store.c`   | History store (save, list, restore, prune) |
-| `src/ipc.c`     | UNIX-socket JSON line protocol |
-| `protocols/`    | Vendored `wlr-layer-shell` XML + generated glue |
-| `third_party/`  | Vendored `stb_image` / `stb_image_resize2` |
+| `src/openai.c`  | OpenAI image API client (libcurl + cJSON + base64)         |
+| `src/image.c`   | Decode / cover-fit / blit (stb)                            |
+| `src/store.c`   | History store (save, list, restore, prune)                 |
+| `src/ipc.c`     | UNIX-socket JSON line protocol                             |
+| `protocols/`    | Vendored `wlr-layer-shell` XML + generated glue            |
+| `third_party/`  | Vendored `stb_image` / `stb_image_resize2`                 |
 
 ---
 
@@ -181,9 +181,52 @@ through again — no killing, no config edits, no reboot:
 background --stop
 ```
 
-To make `background` your *only* wallpaper tool instead, leave `BG_LAYER` at the
-default (`background`) and remove the `exec-once = hyprpaper` line from
-`~/.config/hypr/hyprland.conf`.
+To make `background` your _only_ wallpaper tool instead, leave `BG_LAYER` at the
+default (`background`) and replace your existing wallpaper autostart — see below.
+
+---
+
+## Autostart: replacing your wallpaper tool on Hyprland
+
+To make `background` your permanent wallpaper daemon (instead of hyprpaper, swww,
+swaybg, …), start it from your compositor's autostart and disable the old tool.
+On daemon startup `background` automatically restores the last wallpaper you set
+(stored in `~/.cache/background`), so your wallpaper survives reboots.
+
+**1. Make the binary easy to launch.** Either install it onto your `PATH`:
+
+```sh
+make install            # installs to ~/.local/bin/background (PREFIX overridable)
+```
+
+…or just note its absolute path (e.g. `/home/you/code/background/background`) and
+use that below. (`make install` assumes `~/.local/bin` is on your `PATH`.)
+
+**2. Edit `~/.config/hypr/hyprland.conf`.** Comment out your current wallpaper
+autostart and add `background`:
+
+```diff
+- exec-once = hyprpaper
++ exec-once = background daemon          # if installed on PATH
++ # exec-once = /home/you/code/background/background daemon   # or absolute path
+```
+
+If you used a different tool, comment out its line instead, e.g.
+`exec-once = swww-daemon` or `exec-once = swaybg -i ~/wall.png`.
+
+**3. Apply it.** Reboot, or for the current session:
+
+```sh
+pkill hyprpaper                      # stop the old tool now (swww kill / pkill swaybg)
+background restore last              # bring your last wallpaper up immediately
+hyprctl reload                       # reload config (picks up the autostart edit)
+```
+
+From then on, `background generate "…"`, `restore`, etc. control your wallpaper,
+and the daemon comes back with your last wallpaper after every login.
+
+To **revert** to your old tool: uncomment its `exec-once` line, remove the
+`background daemon` line, `background --stop`, and reload.
 
 ---
 
@@ -191,13 +234,13 @@ default (`background`) and remove the `exec-once = hyprpaper` line from
 
 Read by the **daemon** at startup (set them before the command that spawns it):
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `OPENAI_API_KEY` | — | Required for `generate`. |
-| `BG_LAYER`   | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`. |
-| `BG_FADE_MS` | `400` | Crossfade duration in ms. `0` disables fades. |
-| `XDG_CACHE_HOME` | `~/.cache` | History lives in `$XDG_CACHE_HOME/background`. |
-| `XDG_RUNTIME_DIR` | — | Daemon socket lives here (`background.sock`); falls back to `/tmp`. |
+| Variable          | Default      | Meaning                                                             |
+| ----------------- | ------------ | ------------------------------------------------------------------- |
+| `OPENAI_API_KEY`  | —            | Required for `generate`.                                            |
+| `BG_LAYER`        | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`.       |
+| `BG_FADE_MS`      | `400`        | Crossfade duration in ms. `0` disables fades.                       |
+| `XDG_CACHE_HOME`  | `~/.cache`   | History lives in `$XDG_CACHE_HOME/background`.                      |
+| `XDG_RUNTIME_DIR` | —            | Daemon socket lives here (`background.sock`); falls back to `/tmp`. |
 
 ---
 
