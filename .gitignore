@@ -1,0 +1,5 @@
+background
+*.o
+protocols/*-client-protocol.h
+protocols/*-protocol.c
+.cache/

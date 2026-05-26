@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - -xc
+    - -std=gnu11
+    - -D_GNU_SOURCE
+    - -Isrc
+    - -Iprotocols
+    - -Ithird_party
+    - -I/usr/include/cjson
