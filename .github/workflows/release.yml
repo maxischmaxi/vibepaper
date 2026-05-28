@@ -82,8 +82,11 @@ jobs:
           # newline/whitespace mangling); decode it back to the real key here.
           printf '%s' "$AUR_SSH_KEY" | base64 -d > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-          export GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes'
+          # Seed the AUR host key (best effort); accept-new also accepts it on
+          # the first connect, so the clone can't fail with "Host key
+          # verification failed" even when the keyscan comes back empty.
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null || true
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
           git clone ssh://aur@aur.archlinux.org/vibepaper.git aur
           cp packaging/stable/PKGBUILD packaging/stable/.SRCINFO aur/
           cd aur
