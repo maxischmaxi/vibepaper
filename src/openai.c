@@ -86,6 +86,44 @@ static int b64_decode(const char *src, uint8_t **out, size_t *out_len) {
     return 0;
 }
 
+// ---------- API key resolution ----------
+
+static char *read_first_line(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char buf[1024];
+    char *r = fgets(buf, sizeof(buf), f);
+    fclose(f);
+    if (!r) return NULL;
+    size_t n = strlen(buf);
+    while (n && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' ' || buf[n-1] == '\t'))
+        buf[--n] = '\0';
+    return n ? strdup(buf) : NULL;
+}
+
+// Resolve the key from (in order): explicit option, OPENAI_API_KEY env,
+// OPENAI_API_KEY_FILE, or ~/.config/background/api_key. The file fallbacks let
+// the daemon work when launched without a shell environment (e.g. from a
+// compositor autostart). Returns a malloc'd string, or NULL.
+static char *resolve_api_key(const bg_openai_opts *opts) {
+    if (opts && opts->api_key && *opts->api_key) return strdup(opts->api_key);
+    const char *env = getenv("OPENAI_API_KEY");
+    if (env && *env) return strdup(env);
+    const char *kf = getenv("OPENAI_API_KEY_FILE");
+    if (kf && *kf) { char *k = read_first_line(kf); if (k) return k; }
+
+    char path[1024];
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        snprintf(path, sizeof(path), "%s/background/api_key", xdg);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return NULL;
+        snprintf(path, sizeof(path), "%s/.config/background/api_key", home);
+    }
+    return read_first_line(path);
+}
+
 // ---------- public API ----------
 
 void bg_openai_global_init(void)    { curl_global_init(CURL_GLOBAL_DEFAULT); }
@@ -96,11 +134,15 @@ bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
     const char *model   = (opts && opts->model)   ? opts->model   : DEFAULT_MODEL;
     const char *size    = (opts && opts->size)    ? opts->size    : DEFAULT_SIZE;
     const char *quality = (opts && opts->quality) ? opts->quality : DEFAULT_QUALITY;
-    const char *api_key = (opts && opts->api_key) ? opts->api_key : getenv("OPENAI_API_KEY");
-    if (!api_key || !*api_key) {
-        LOG_ERR("openai: OPENAI_API_KEY not set");
+    char *api_key = resolve_api_key(opts);
+    if (!api_key) {
+        LOG_ERR("openai: no API key — set OPENAI_API_KEY, OPENAI_API_KEY_FILE, "
+                "or write the key to ~/.config/background/api_key");
         return false;
     }
+    char auth[1100];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+    free(api_key);
 
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "model", model);
@@ -121,8 +163,6 @@ bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
 
     buf_t resp = {0};
     struct curl_slist *headers = NULL;
-    char auth[512];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
     headers = curl_slist_append(headers, auth);
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: application/json");

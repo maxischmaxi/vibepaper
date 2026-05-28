@@ -193,6 +193,10 @@ swaybg, …), start it from your compositor's autostart and disable the old tool
 On daemon startup `background` automatically restores the last wallpaper you set
 (stored in `~/.cache/background`), so your wallpaper survives reboots.
 
+> **Put your API key in a file first.** A compositor-launched daemon won't see
+> `OPENAI_API_KEY` from your shell — write it to `~/.config/background/api_key`
+> (see [API key resolution](#api-key-resolution)) or `generate` will fail.
+
 **1. Make the binary easy to launch.** Either install it onto your `PATH`:
 
 ```sh
@@ -234,13 +238,32 @@ To **revert** to your old tool: uncomment its `exec-once` line, remove the
 
 Read by the **daemon** at startup (set them before the command that spawns it):
 
-| Variable          | Default      | Meaning                                                             |
-| ----------------- | ------------ | ------------------------------------------------------------------- |
-| `OPENAI_API_KEY`  | —            | Required for `generate`.                                            |
-| `BG_LAYER`        | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`.       |
-| `BG_FADE_MS`      | `400`        | Crossfade duration in ms. `0` disables fades.                       |
-| `XDG_CACHE_HOME`  | `~/.cache`   | History lives in `$XDG_CACHE_HOME/background`.                      |
-| `XDG_RUNTIME_DIR` | —            | Daemon socket lives here (`background.sock`); falls back to `/tmp`. |
+| Variable               | Default      | Meaning                                                             |
+| ---------------------- | ------------ | ------------------------------------------------------------------- |
+| `OPENAI_API_KEY`       | —            | API key for `generate` (see key resolution below).                 |
+| `OPENAI_API_KEY_FILE`  | —            | Path to a file whose first line is the API key.                     |
+| `BG_LAYER`             | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`.       |
+| `BG_FADE_MS`           | `400`        | Crossfade duration in ms. `0` disables fades.                       |
+| `XDG_CACHE_HOME`       | `~/.cache`   | History lives in `$XDG_CACHE_HOME/background`.                      |
+| `XDG_RUNTIME_DIR`      | —            | Daemon socket lives here (`background.sock`); falls back to `/tmp`. |
+
+### API key resolution
+
+For `generate`, the key is resolved in this order:
+
+1. `OPENAI_API_KEY` environment variable
+2. file named by `OPENAI_API_KEY_FILE`
+3. `~/.config/background/api_key` (first line)
+
+**This matters for autostart.** A daemon launched by your compositor at login
+does *not* inherit your shell's environment, so `OPENAI_API_KEY` from `~/.zshrc`
+won't be visible to it. Put the key in a file instead:
+
+```sh
+mkdir -p ~/.config/background
+printf '%s\n' "sk-your-key" > ~/.config/background/api_key
+chmod 600 ~/.config/background/api_key
+```
 
 ---
 
