@@ -1,14 +1,21 @@
-// OpenAI image generation client.
+// OpenAI image generation + edit client.
 //
-// POST https://api.openai.com/v1/images/generations
+// Generate — POST https://api.openai.com/v1/images/generations
 //   Authorization: Bearer $OPENAI_API_KEY
 //   Content-Type: application/json
 //   Body (gpt-image-2):
 //     { "model":"gpt-image-2", "prompt":"…", "n":1,
 //       "size":"1536x1024", "quality":"medium" }
-//   gpt-image-* always return base64 and reject "response_format".
-//   Response:
-//     { "created":…, "data":[ { "b64_json":"…" } ] }
+//
+// Edit ("refine") — POST https://api.openai.com/v1/images/edits
+//   Authorization: Bearer $OPENAI_API_KEY
+//   Content-Type: multipart/form-data   (set by libcurl, do NOT send it)
+//   Parts: image=<source png>, prompt, model, size, quality, n.
+//   gpt-image-2 keeps inputs at high fidelity automatically, so we omit
+//   "input_fidelity" (the model rejects it).
+//
+// Both endpoints: gpt-image-* always return base64 and reject "response_format",
+// so we don't send it. Response: { "created":…, "data":[ { "b64_json":"…" } ] }
 
 #include "openai.h"
 #include "log.h"
@@ -21,7 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define API_URL "https://api.openai.com/v1/images/generations"
+#define API_URL  "https://api.openai.com/v1/images/generations"
+#define EDIT_URL "https://api.openai.com/v1/images/edits"
 
 #define DEFAULT_MODEL    BG_OPENAI_DEFAULT_MODEL
 #define DEFAULT_SIZE     BG_OPENAI_DEFAULT_SIZE
@@ -102,7 +110,7 @@ static char *read_first_line(const char *path) {
 }
 
 // Resolve the key from (in order): explicit option, OPENAI_API_KEY env,
-// OPENAI_API_KEY_FILE, or ~/.config/background/api_key. The file fallbacks let
+// OPENAI_API_KEY_FILE, or ~/.config/vibepaper/api_key. The file fallbacks let
 // the daemon work when launched without a shell environment (e.g. from a
 // compositor autostart). Returns a malloc'd string, or NULL.
 static char *resolve_api_key(const bg_openai_opts *opts) {
@@ -115,11 +123,11 @@ static char *resolve_api_key(const bg_openai_opts *opts) {
     char path[1024];
     const char *xdg = getenv("XDG_CONFIG_HOME");
     if (xdg && *xdg) {
-        snprintf(path, sizeof(path), "%s/background/api_key", xdg);
+        snprintf(path, sizeof(path), "%s/vibepaper/api_key", xdg);
     } else {
         const char *home = getenv("HOME");
         if (!home || !*home) return NULL;
-        snprintf(path, sizeof(path), "%s/.config/background/api_key", home);
+        snprintf(path, sizeof(path), "%s/.config/vibepaper/api_key", home);
     }
     return read_first_line(path);
 }
@@ -129,53 +137,17 @@ static char *resolve_api_key(const bg_openai_opts *opts) {
 void bg_openai_global_init(void)    { curl_global_init(CURL_GLOBAL_DEFAULT); }
 void bg_openai_global_cleanup(void) { curl_global_cleanup(); }
 
-bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
-                        bg_openai_result *out) {
-    const char *model   = (opts && opts->model)   ? opts->model   : DEFAULT_MODEL;
-    const char *size    = (opts && opts->size)    ? opts->size    : DEFAULT_SIZE;
-    const char *quality = (opts && opts->quality) ? opts->quality : DEFAULT_QUALITY;
-    char *api_key = resolve_api_key(opts);
-    if (!api_key) {
-        LOG_ERR("openai: no API key — set OPENAI_API_KEY, OPENAI_API_KEY_FILE, "
-                "or write the key to ~/.config/background/api_key");
-        return false;
-    }
-    char auth[1100];
-    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
-    free(api_key);
-
-    cJSON *body = cJSON_CreateObject();
-    cJSON_AddStringToObject(body, "model", model);
-    cJSON_AddStringToObject(body, "prompt", prompt);
-    cJSON_AddNumberToObject(body, "n", 1);
-    cJSON_AddStringToObject(body, "size", size);
-    cJSON_AddStringToObject(body, "quality", quality);
-    // Note: gpt-image-* models always return base64 and reject "response_format"
-    // (unlike the older dall-e models), so we don't send it.
-    char *body_str = cJSON_PrintUnformatted(body);
-    cJSON_Delete(body);
-    if (!body_str) { LOG_ERR("openai: json print failed"); return false; }
-
-    LOG_INFO("openai: generating (model=%s size=%s quality=%s)…", model, size, quality);
-
-    CURL *curl = curl_easy_init();
-    if (!curl) { free(body_str); LOG_ERR("openai: curl_easy_init failed"); return false; }
-
+// Run a request whose URL/method/body are already configured on `curl`, then
+// decode data[0].b64_json into `out`. Sets the shared write callback, timeout
+// and user-agent itself. `what` only labels the success log line. Shared by
+// generate and edit (their only difference is how the body is attached).
+static bool perform_image_request(CURL *curl, const char *what,
+                                  bg_openai_result *out) {
     buf_t resp = {0};
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, auth);
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Accept: application/json");
-
-    curl_easy_setopt(curl, CURLOPT_URL, API_URL);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body_str));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, buf_write);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "background/0.1");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "vibepaper/0.1");
 
     bool ok = false;
     CURLcode rc = curl_easy_perform(curl);
@@ -208,17 +180,120 @@ bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
                     out->data = bytes;
                     out->len = nbytes;
                     ok = true;
-                    LOG_INFO("openai: received %zu bytes", nbytes);
+                    LOG_INFO("openai: %s received %zu bytes", what, nbytes);
                 }
             }
             cJSON_Delete(root);
         }
     }
+    free(resp.data);
+    return ok;
+}
+
+bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
+                        bg_openai_result *out) {
+    const char *model   = (opts && opts->model)   ? opts->model   : DEFAULT_MODEL;
+    const char *size    = (opts && opts->size)    ? opts->size    : DEFAULT_SIZE;
+    const char *quality = (opts && opts->quality) ? opts->quality : DEFAULT_QUALITY;
+    char *api_key = resolve_api_key(opts);
+    if (!api_key) {
+        LOG_ERR("openai: no API key — set OPENAI_API_KEY, OPENAI_API_KEY_FILE, "
+                "or write the key to ~/.config/vibepaper/api_key");
+        return false;
+    }
+    char auth[1100];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+    free(api_key);
+
+    cJSON *body = cJSON_CreateObject();
+    cJSON_AddStringToObject(body, "model", model);
+    cJSON_AddStringToObject(body, "prompt", prompt);
+    cJSON_AddNumberToObject(body, "n", 1);
+    cJSON_AddStringToObject(body, "size", size);
+    cJSON_AddStringToObject(body, "quality", quality);
+    // Note: gpt-image-* models always return base64 and reject "response_format"
+    // (unlike the older dall-e models), so we don't send it.
+    char *body_str = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!body_str) { LOG_ERR("openai: json print failed"); return false; }
+
+    LOG_INFO("openai: generating (model=%s size=%s quality=%s)…", model, size, quality);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) { free(body_str); LOG_ERR("openai: curl_easy_init failed"); return false; }
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, auth);
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, API_URL);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body_str);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(body_str));
+
+    bool ok = perform_image_request(curl, "generate", out);
 
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     free(body_str);
-    free(resp.data);
+    return ok;
+}
+
+bool bg_openai_edit(const char *image_path, const char *prompt,
+                    const bg_openai_opts *opts, bg_openai_result *out) {
+    const char *model   = (opts && opts->model)   ? opts->model   : DEFAULT_MODEL;
+    const char *size    = (opts && opts->size)    ? opts->size    : DEFAULT_SIZE;
+    const char *quality = (opts && opts->quality) ? opts->quality : DEFAULT_QUALITY;
+    char *api_key = resolve_api_key(opts);
+    if (!api_key) {
+        LOG_ERR("openai: no API key — set OPENAI_API_KEY, OPENAI_API_KEY_FILE, "
+                "or write the key to ~/.config/vibepaper/api_key");
+        return false;
+    }
+    char auth[1100];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+    free(api_key);
+
+    LOG_INFO("openai: editing %s (model=%s size=%s quality=%s)…",
+             image_path, model, size, quality);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) { LOG_ERR("openai: curl_easy_init failed"); return false; }
+
+    // multipart/form-data: the source image plus text fields. libcurl sets the
+    // Content-Type (with boundary) for CURLOPT_MIMEPOST, so we must not send it.
+    curl_mime *mime = curl_mime_init(curl);
+    curl_mimepart *part = curl_mime_addpart(mime);
+    curl_mime_name(part, "image");
+    if (curl_mime_filedata(part, image_path) != CURLE_OK) {
+        LOG_ERR("openai: cannot attach source image %s", image_path);
+        curl_mime_free(mime);
+        curl_easy_cleanup(curl);
+        return false;
+    }
+    curl_mime_type(part, "image/png");
+
+    part = curl_mime_addpart(mime); curl_mime_name(part, "model");   curl_mime_data(part, model,   CURL_ZERO_TERMINATED);
+    part = curl_mime_addpart(mime); curl_mime_name(part, "prompt");  curl_mime_data(part, prompt,  CURL_ZERO_TERMINATED);
+    part = curl_mime_addpart(mime); curl_mime_name(part, "size");    curl_mime_data(part, size,    CURL_ZERO_TERMINATED);
+    part = curl_mime_addpart(mime); curl_mime_name(part, "quality"); curl_mime_data(part, quality, CURL_ZERO_TERMINATED);
+    part = curl_mime_addpart(mime); curl_mime_name(part, "n");       curl_mime_data(part, "1",      CURL_ZERO_TERMINATED);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, auth);
+    headers = curl_slist_append(headers, "Accept: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, EDIT_URL);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+
+    bool ok = perform_image_request(curl, "edit", out);
+
+    curl_slist_free_all(headers);
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
     return ok;
 }
 

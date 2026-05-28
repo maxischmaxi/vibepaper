@@ -42,6 +42,7 @@ typedef struct gen_request {
     int   client_fd;        // who to reply to (-1 if gone)
     char *prompt, *model, *size, *quality;
     char *output;           // target output name, NULL = all
+    char *src_path;         // edit source image; NULL = plain generate
 } gen_request;
 
 typedef struct {
@@ -83,6 +84,18 @@ static void reply_err(int fd, const char *msg) {
     cJSON_AddStringToObject(o, "error", msg);
     char *s = cJSON_PrintUnformatted(o);
     bg_ipc_write_line(fd, s ? s : "{\"ok\":false}");
+    free(s);
+    cJSON_Delete(o);
+}
+
+// Intermediate status line sent before the final result. The client may render
+// it as a spinner label; non-progress-aware callers only read the final line.
+static void reply_progress(int fd, const char *msg) {
+    if (fd < 0) return;
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "progress", msg);
+    char *s = cJSON_PrintUnformatted(o);
+    if (s) bg_ipc_write_line(fd, s);
     free(s);
     cJSON_Delete(o);
 }
@@ -145,8 +158,15 @@ static void *gen_worker(void *arg) {
     daemon_ctx *ctx = arg;
     gen_job *j = &ctx->job;
     bg_openai_opts opts = { .model = j->req.model, .size = j->req.size, .quality = j->req.quality };
-    j->ok = bg_openai_generate(j->req.prompt, &opts, &j->res);
+    if (j->req.src_path) {
+        reply_progress(j->req.client_fd, "Refining image with OpenAI");
+        j->ok = bg_openai_edit(j->req.src_path, j->req.prompt, &opts, &j->res);
+    } else {
+        reply_progress(j->req.client_fd, "Generating image with OpenAI");
+        j->ok = bg_openai_generate(j->req.prompt, &opts, &j->res);
+    }
     if (!j->ok) snprintf(j->err, sizeof(j->err), "openai request failed (see daemon log)");
+    else reply_progress(j->req.client_fd, "Image received");
 
     uint64_t one = 1;
     ssize_t wr = write(ctx->gen_evfd, &one, sizeof(one)); // wake the main loop
@@ -155,21 +175,25 @@ static void *gen_worker(void *arg) {
 }
 
 static void request_free_fields(gen_request *r) {
-    free(r->prompt); free(r->model); free(r->size); free(r->quality); free(r->output);
-    r->prompt = r->model = r->size = r->quality = r->output = NULL;
+    free(r->prompt); free(r->model); free(r->size); free(r->quality);
+    free(r->output); free(r->src_path);
+    r->prompt = r->model = r->size = r->quality = r->output = r->src_path = NULL;
 }
 
-// Allocate a request with copies of the given fields.
+// Allocate a request with copies of the given fields. `src_path` non-NULL marks
+// this as an edit ("refine") of that image rather than a fresh generation.
 static gen_request *request_new(int client_fd, const char *prompt, const char *model,
-                                const char *size, const char *quality, const char *output) {
+                                const char *size, const char *quality, const char *output,
+                                const char *src_path) {
     gen_request *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->client_fd = client_fd;
-    r->prompt  = strdup(prompt);
-    r->model   = model   ? strdup(model)   : NULL;
-    r->size    = size    ? strdup(size)    : NULL;
-    r->quality = quality ? strdup(quality) : NULL;
-    r->output  = output  ? strdup(output)  : NULL;
+    r->prompt   = strdup(prompt);
+    r->model    = model    ? strdup(model)    : NULL;
+    r->size     = size     ? strdup(size)     : NULL;
+    r->quality  = quality  ? strdup(quality)  : NULL;
+    r->output   = output   ? strdup(output)   : NULL;
+    r->src_path = src_path ? strdup(src_path) : NULL;
     return r;
 }
 
@@ -220,7 +244,7 @@ static bool start_job(daemon_ctx *ctx, gen_request *r) {
         j->active = false;
         return false;
     }
-    LOG_INFO("generate: worker started (queue depth %zu)", ctx->q_len);
+    LOG_INFO("worker started (queue depth %zu)", ctx->q_len);
     return true;
 }
 
@@ -239,6 +263,7 @@ static void gen_complete(daemon_ctx *ctx) {
     if (!j->ok) {
         reply_err(cfd, j->err[0] ? j->err : "generation failed");
     } else {
+        reply_progress(cfd, "Rendering wallpaper");
         char id[BG_ID_MAX] = {0};
         bg_store_add(j->res.data, j->res.len, "png", j->req.prompt,
                      j->req.model   ? j->req.model   : BG_OPENAI_DEFAULT_MODEL,
@@ -271,6 +296,28 @@ static void gen_complete(daemon_ctx *ctx) {
 }
 
 // ---------- command dispatch ----------
+
+// Hand a freshly built request to the worker, or queue it if one is running.
+// Sets *fd_taken when the request now owns client_fd (caller must not close it).
+// Replies and frees on out-of-memory / queue-full.
+static void submit_request(daemon_ctx *ctx, int client_fd, gen_request *r, bool *fd_taken) {
+    if (!r) {
+        reply_err(client_fd, "out of memory");
+    } else if (!ctx->job.active) {
+        start_job(ctx, r);          // owns/closes the fd in all cases
+        *fd_taken = true;
+    } else if (queue_push(ctx, r)) {
+        char qmsg[64];
+        snprintf(qmsg, sizeof(qmsg), "Queued (position %zu)", ctx->q_len);
+        reply_progress(client_fd, qmsg);
+        LOG_INFO("request queued (depth %zu)", ctx->q_len);
+        *fd_taken = true;           // queue owns the fd until processed
+    } else {
+        reply_err(client_fd, "queue full");
+        request_free_fields(r);
+        free(r);
+    }
+}
 
 // Returns true if client_fd was handed to an async job (caller must NOT close).
 static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
@@ -322,19 +369,44 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
                                  cJSON_IsString(model)   ? model->valuestring   : NULL,
                                  cJSON_IsString(size)    ? size->valuestring    : NULL,
                                  cJSON_IsString(quality) ? quality->valuestring : NULL,
-                                 out);
-            if (!r) {
-                reply_err(client_fd, "out of memory");
-            } else if (!ctx->job.active) {
-                start_job(ctx, r);  // owns/closes the fd in all cases
-                fd_taken = true;
-            } else if (queue_push(ctx, r)) {
-                LOG_INFO("generate: queued (depth %zu)", ctx->q_len);
-                fd_taken = true;    // queue owns the fd until processed
+                                 out, NULL);
+            submit_request(ctx, client_fd, r, &fd_taken);
+        }
+    } else if (strcmp(c, "refine") == 0) {
+        const cJSON *prompt  = cJSON_GetObjectItem(root, "prompt");
+        const cJSON *srcv    = cJSON_GetObjectItem(root, "src");
+        const cJSON *size    = cJSON_GetObjectItem(root, "size");
+        const cJSON *quality = cJSON_GetObjectItem(root, "quality");
+        const cJSON *model   = cJSON_GetObjectItem(root, "model");
+        if (!cJSON_IsString(prompt)) {
+            reply_err(client_fd, "refine: missing prompt");
+        } else {
+            // Resolve the source image: explicit --from, else the current one.
+            bg_store_entry e;
+            int got;
+            if (cJSON_IsString(srcv)) {
+                got = resolve_entry(srcv->valuestring, &e);
             } else {
-                reply_err(client_fd, "queue full");
-                request_free_fields(r);
-                free(r);
+                char cur[BG_ID_MAX];
+                got = (bg_store_get_current(cur, sizeof(cur)) == 0)
+                        ? bg_store_get(cur, &e) : -1;
+            }
+            if (got != 0) {
+                reply_err(client_fd, cJSON_IsString(srcv)
+                              ? "refine: no such source entry"
+                              : "refine: no current wallpaper to refine");
+            } else {
+                // Default the output size to the source's size so the wallpaper
+                // format stays stable across refinements (unless overridden).
+                const char *eff_size = cJSON_IsString(size) ? size->valuestring
+                                     : (e.size ? e.size : NULL);
+                gen_request *r = request_new(client_fd, prompt->valuestring,
+                                     cJSON_IsString(model)   ? model->valuestring   : NULL,
+                                     eff_size,
+                                     cJSON_IsString(quality) ? quality->valuestring : NULL,
+                                     out, e.path);
+                submit_request(ctx, client_fd, r, &fd_taken);
+                bg_store_entry_clear(&e);
             }
         }
     } else if (strcmp(c, "restore") == 0) {

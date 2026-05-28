@@ -26,11 +26,11 @@ static int resolve_dir(void) {
     const char *base = getenv("XDG_CACHE_HOME");
     int n;
     if (base && *base) {
-        n = snprintf(g_dir, sizeof(g_dir), "%s/background", base);
+        n = snprintf(g_dir, sizeof(g_dir), "%s/vibepaper", base);
     } else {
         const char *home = getenv("HOME");
         if (!home || !*home) { LOG_ERR("store: HOME not set"); return -1; }
-        n = snprintf(g_dir, sizeof(g_dir), "%s/.cache/background", home);
+        n = snprintf(g_dir, sizeof(g_dir), "%s/.cache/vibepaper", home);
     }
     if (n < 0 || (size_t)n >= sizeof(g_dir)) return -1;
     return 0;
@@ -210,11 +210,16 @@ void bg_store_free_list(bg_store_entry *list, size_t count) {
 // ---------- list ----------
 
 static int cmp_ts_desc(const void *a, const void *b) {
-    long ta = ((const bg_store_entry *)a)->ts;
-    long tb = ((const bg_store_entry *)b)->ts;
-    if (ta < tb) return 1;
-    if (ta > tb) return -1;
-    return 0;
+    const bg_store_entry *ea = a, *eb = b;
+    if (ea->ts < eb->ts) return 1;
+    if (ea->ts > eb->ts) return -1;
+    // Tie-break by id (descending) so the order — and therefore the index shown
+    // by `list` — is stable across calls even when two images share the same
+    // one-second timestamp. readdir() order is unspecified and qsort() is not
+    // stable, so without this `restore <N>` could resolve to a different image
+    // than the one `list` numbered N. IDs encode creation order (YYYYMMDD-HHMMSS
+    // plus a monotonic same-second suffix), so descending id == newest first.
+    return strcmp(eb->id, ea->id);
 }
 
 int bg_store_list(bg_store_entry **out, size_t *count) {

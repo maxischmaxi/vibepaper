@@ -27,7 +27,7 @@ bg_wayland *bg_wayland_init(void);
 void bg_wayland_destroy(bg_wayland *w);
 
 // Crossfade duration in milliseconds for subsequent source changes. 0 = instant.
-// Defaults to the BG_FADE_MS env var, or 400ms.
+// Defaults to the VIBEPAPER_FADE_MS env var, or 400ms.
 void bg_wayland_set_fade_ms(bg_wayland *w, unsigned ms);
 
 // Replace the global source on every output and clear per-output overrides.

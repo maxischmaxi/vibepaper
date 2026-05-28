@@ -35,7 +35,7 @@ PROTO_OBJS := $(PROTO_SRCS:.c=.o)
 SRCS := src/main.c src/wayland.c src/image.c src/openai.c src/ipc.c src/daemon.c src/store.c
 OBJS := $(SRCS:.c=.o) $(PROTO_OBJS)
 
-BIN := background
+BIN := vibepaper
 PREFIX ?= $(HOME)/.local
 
 .PHONY: all clean distclean install uninstall

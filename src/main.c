@@ -1,12 +1,12 @@
-// background — Wayland layer-shell wallpaper tool with OpenAI image generation.
+// vibepaper — Wayland layer-shell wallpaper tool with OpenAI image generation.
 //
 // Usage:
-//   background daemon                          # run the renderer + IPC server
-//   background --color RRGGBB                  # solid color
-//   background --file PATH                     # PNG / JPEG / WebP
-//   background generate "prompt" [--size S] [--quality Q] [--model M]
-//   background --stop                          # shut the daemon down
-//   background --help
+//   vibepaper daemon                          # run the renderer + IPC server
+//   vibepaper --color RRGGBB                  # solid color
+//   vibepaper --file PATH                     # PNG / JPEG / WebP
+//   vibepaper generate "prompt" [--size S] [--quality Q] [--model M]
+//   vibepaper --stop                          # shut the daemon down
+//   vibepaper --help
 //
 // The non-daemon commands talk to a running daemon over a UNIX socket. If no
 // daemon is listening, one is fork+execed automatically before the request.
@@ -19,26 +19,30 @@
 #include <cJSON.h>
 
 #include <errno.h>
+#include <poll.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 static void usage(FILE *f) {
     fputs(
 "Usage:\n"
-"  background daemon\n"
-"  background --color RRGGBB\n"
-"  background --file PATH\n"
-"  background generate \"prompt\" [--size SIZE] [--quality Q] [--model M] [--output NAME]\n"
-"  background list                            # past wallpapers, newest first\n"
-"  background restore ID|INDEX|last [--output NAME]\n"
-"  background current                         # show the active wallpaper\n"
-"  background outputs                         # list connected outputs\n"
-"  background prune [--keep N]                # delete old history (default keep 20)\n"
-"  background --stop\n"
-"  background --help\n"
+"  vibepaper daemon\n"
+"  vibepaper --color RRGGBB\n"
+"  vibepaper --file PATH\n"
+"  vibepaper generate \"prompt\" [--size SIZE] [--quality Q] [--model M] [--output NAME]\n"
+"  vibepaper refine \"prompt\" [--from ID|INDEX|last] [--size SIZE] [--quality Q] [--model M] [--output NAME]\n"
+"  vibepaper list                            # past wallpapers, newest first\n"
+"  vibepaper restore ID|INDEX|last [--output NAME]\n"
+"  vibepaper current                         # show the active wallpaper\n"
+"  vibepaper outputs                         # list connected outputs\n"
+"  vibepaper prune [--keep N]                # delete old history (default keep 20)\n"
+"  vibepaper --stop\n"
+"  vibepaper --help\n"
 "\n"
 "--color and --file also accept [--output NAME] to target a single output.\n"
 "Without --output a command applies to all outputs.\n"
@@ -46,8 +50,8 @@ static void usage(FILE *f) {
 "Sizes (gpt-image-2): auto, 1024x1024, 1536x1024 (default), 1024x1536,\n"
 "                     2048x2048, 2048x1152, 3840x2160, 2160x3840\n"
 "Qualities: low, medium (default), high, auto\n"
-"Crossfade: set BG_FADE_MS (default 400, 0 = instant) before starting the daemon.\n"
-"Layer:     set BG_LAYER=bottom to sit above hyprpaper without disabling it\n"
+"Crossfade: set VIBEPAPER_FADE_MS (default 400, 0 = instant) before starting the daemon.\n"
+"Layer:     set VIBEPAPER_LAYER=bottom to sit above hyprpaper without disabling it\n"
 "           (background|bottom|top|overlay; default background).\n",
         f);
 }
@@ -109,6 +113,146 @@ static int send_request(cJSON *body) {
         cJSON_Delete(root);
     }
     free(resp);
+    return exit_code;
+}
+
+// ---------- spinner (for long-running generate) ----------
+
+static const char *const SPIN_FRAMES[] = {
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+};
+#define SPIN_N ((int)(sizeof(SPIN_FRAMES) / sizeof(SPIN_FRAMES[0])))
+
+typedef struct {
+    char            msg[160];
+    int             frame;
+    struct timespec start;
+    bool            tty;
+} spinner;
+
+static int spinner_elapsed(const spinner *s) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int)(now.tv_sec - s->start.tv_sec);
+}
+
+static void spinner_init(spinner *s) {
+    s->msg[0] = '\0';
+    s->frame = 0;
+    s->tty = isatty(STDERR_FILENO);
+    clock_gettime(CLOCK_MONOTONIC, &s->start);
+}
+
+// Update the label. On a non-TTY this prints one plain line per stage.
+static void spinner_set(spinner *s, const char *msg) {
+    snprintf(s->msg, sizeof(s->msg), "%s", msg);
+    if (!s->tty) fprintf(stderr, "%s\n", msg);
+}
+
+// Redraw the in-place animated line (TTY only).
+static void spinner_tick(spinner *s) {
+    if (!s->tty) return;
+    fprintf(stderr, "\r\033[36m%s\033[0m %s \033[2m(%ds)\033[0m\033[K",
+            SPIN_FRAMES[s->frame % SPIN_N], s->msg, spinner_elapsed(s));
+    fflush(stderr);
+    s->frame++;
+}
+
+static void spinner_clear(spinner *s) {
+    if (s->tty) { fprintf(stderr, "\r\033[K"); fflush(stderr); }
+}
+
+static void spinner_done(spinner *s, const char *msg) {
+    if (s->tty)
+        fprintf(stderr, "\r\033[32m✓\033[0m %s \033[2m(%ds)\033[0m\033[K\n", msg, spinner_elapsed(s));
+    else
+        fprintf(stderr, "%s (%ds)\n", msg, spinner_elapsed(s));
+}
+
+// Like send_request, but renders a spinner with live status text while waiting
+// for the daemon. The daemon streams {"progress":"…"} lines before the final
+// {"ok":…}. Used for generate, which can take tens of seconds.
+static int send_request_with_progress(cJSON *body) {
+    char *s = cJSON_PrintUnformatted(body);
+    cJSON_Delete(body);
+    if (!s) { LOG_ERR("json serialise failed"); return 1; }
+
+    spinner sp;
+    spinner_init(&sp);
+    spinner_set(&sp, "Connecting to wallpaper daemon");
+    spinner_tick(&sp);
+
+    int fd = bg_ipc_client_connect();
+    if (fd < 0 && (errno == ENOENT || errno == ECONNREFUSED)) {
+        spinner_set(&sp, "Starting wallpaper daemon");
+        spinner_tick(&sp);
+        char *self = self_exe_path();
+        if (self) { bg_daemon_spawn(self); free(self); }
+        fd = bg_ipc_client_connect();
+    }
+    if (fd < 0) {
+        spinner_clear(&sp);
+        LOG_ERR("ipc connect: %s", strerror(errno));
+        free(s);
+        return 1;
+    }
+
+    if (bg_ipc_write_line(fd, s) < 0) {
+        spinner_clear(&sp);
+        LOG_ERR("ipc write failed");
+        free(s); close(fd);
+        return 1;
+    }
+    free(s);
+    spinner_set(&sp, "Sending prompt");
+    spinner_tick(&sp);
+
+    int  exit_code = 1;
+    bool got_final = false;
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, sp.tty ? 100 : 1000);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) { spinner_tick(&sp); continue; }
+        if (pfd.revents & POLLIN) {
+            char *line = NULL;
+            if (bg_ipc_read_line(fd, &line) < 0) break;   // EOF / error
+            cJSON *o = cJSON_Parse(line);
+            free(line);
+            if (!o) continue;
+            const cJSON *prog = cJSON_GetObjectItem(o, "progress");
+            const cJSON *ok   = cJSON_GetObjectItem(o, "ok");
+            if (cJSON_IsString(prog)) {
+                spinner_set(&sp, prog->valuestring);
+                spinner_tick(&sp);
+            } else if (ok) {
+                got_final = true;
+                if (cJSON_IsTrue(ok)) {
+                    exit_code = 0;
+                } else {
+                    const cJSON *err = cJSON_GetObjectItem(o, "error");
+                    spinner_clear(&sp);
+                    LOG_ERR("daemon: %s", cJSON_IsString(err) ? err->valuestring : "unknown error");
+                }
+                cJSON_Delete(o);
+                break;
+            }
+            cJSON_Delete(o);
+        }
+        // Only treat HUP/ERR as terminal once no buffered data remains: the
+        // daemon may close the fd in the same instant it writes the final
+        // {"ok":…} line, so POLLIN and POLLHUP can arrive together. We read one
+        // line per iteration, so keep draining while POLLIN is still set.
+        if ((pfd.revents & (POLLHUP | POLLERR)) && !(pfd.revents & POLLIN)) break;
+    }
+    close(fd);
+
+    if (!got_final) {
+        spinner_clear(&sp);
+        LOG_ERR("lost connection to daemon");
+        return 1;
+    }
+    if (exit_code == 0) spinner_done(&sp, "Wallpaper updated");
     return exit_code;
 }
 
@@ -184,7 +328,37 @@ static int cmd_generate(int argc, char **argv) {
     if (quality) cJSON_AddStringToObject(o, "quality", quality);
     if (model)   cJSON_AddStringToObject(o, "model",   model);
     if (output)  cJSON_AddStringToObject(o, "output",  output);
-    return send_request(o);
+    return send_request_with_progress(o);
+}
+
+// Refine (edit) an existing image with a prompt. Without --from the daemon edits
+// the currently displayed wallpaper, so repeated `refine` calls iterate like a
+// chat session. The result is saved as a new history entry and becomes current.
+static int cmd_refine(int argc, char **argv) {
+    if (argc < 1) {
+        LOG_ERR("refine: missing prompt");
+        usage(stderr);
+        return 2;
+    }
+    const char *prompt = argv[0];
+    const char *from = NULL, *size = NULL, *quality = NULL, *model = NULL, *output = NULL;
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "--from")    && i + 1 < argc) from    = argv[++i];
+        else if (!strcmp(argv[i], "--size")    && i + 1 < argc) size    = argv[++i];
+        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) quality = argv[++i];
+        else if (!strcmp(argv[i], "--model")   && i + 1 < argc) model   = argv[++i];
+        else if (!strcmp(argv[i], "--output")  && i + 1 < argc) output  = argv[++i];
+        else { LOG_ERR("unknown flag: %s", argv[i]); return 2; }
+    }
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "cmd", "refine");
+    cJSON_AddStringToObject(o, "prompt", prompt);
+    if (from)    cJSON_AddStringToObject(o, "src",     from);
+    if (size)    cJSON_AddStringToObject(o, "size",    size);
+    if (quality) cJSON_AddStringToObject(o, "quality", quality);
+    if (model)   cJSON_AddStringToObject(o, "model",   model);
+    if (output)  cJSON_AddStringToObject(o, "output",  output);
+    return send_request_with_progress(o);
 }
 
 static void print_prompt_trunc(const char *p, int max) {
@@ -296,6 +470,7 @@ int main(int argc, char **argv) {
     if (!strcmp(a1, "--color")  && argc >= 3)        return cmd_color(argc - 2, argv + 2);
     if (!strcmp(a1, "--file")   && argc >= 3)        return cmd_file(argc - 2, argv + 2);
     if (!strcmp(a1, "generate"))                     return cmd_generate(argc - 2, argv + 2);
+    if (!strcmp(a1, "refine"))                       return cmd_refine(argc - 2, argv + 2);
     if (!strcmp(a1, "list"))                         return cmd_list();
     if (!strcmp(a1, "current"))                      return cmd_current();
     if (!strcmp(a1, "restore") && argc >= 3)         return cmd_restore(argc - 2, argv + 2);

@@ -5,7 +5,7 @@
 #include <stdbool.h>
 
 // Fills `out` with the daemon socket path. Returns 0 / -1.
-// Uses $XDG_RUNTIME_DIR/background.sock when available, falls back to /tmp.
+// Uses $XDG_RUNTIME_DIR/vibepaper.sock when available, falls back to /tmp.
 int bg_ipc_socket_path(char *out, size_t out_len);
 
 // Daemon side: bind + listen on the socket. Returns listen fd, -1 on error.

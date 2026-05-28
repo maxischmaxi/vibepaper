@@ -33,6 +33,14 @@ void bg_openai_global_cleanup(void);
 bool bg_openai_generate(const char *prompt, const bg_openai_opts *opts,
                         bg_openai_result *out);
 
+// Synchronous edit ("refine"): sends the image at `image_path` together with a
+// prompt to the edits endpoint and returns a new image. `opts` and `out` work
+// exactly as for bg_openai_generate; if opts->size is NULL the caller's intent
+// is the API default. Returns true on success, false on error (and logs).
+// Safe to call from a worker thread once bg_openai_global_init has run.
+bool bg_openai_edit(const char *image_path, const char *prompt,
+                    const bg_openai_opts *opts, bg_openai_result *out);
+
 void bg_openai_free_result(bg_openai_result *res);
 
 #endif

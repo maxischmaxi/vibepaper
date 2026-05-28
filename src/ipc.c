@@ -16,9 +16,9 @@ int bg_ipc_socket_path(char *out, size_t out_len) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
     int n;
     if (xdg && *xdg) {
-        n = snprintf(out, out_len, "%s/background.sock", xdg);
+        n = snprintf(out, out_len, "%s/vibepaper.sock", xdg);
     } else {
-        n = snprintf(out, out_len, "/tmp/background-%u.sock", (unsigned)getuid());
+        n = snprintf(out, out_len, "/tmp/vibepaper-%u.sock", (unsigned)getuid());
     }
     if (n < 0 || (size_t)n >= out_len) return -1;
     return 0;

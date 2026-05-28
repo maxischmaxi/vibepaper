@@ -401,7 +401,7 @@ static void output_setup_layer(bg_output_state *o) {
 
     o->layer_surface = zwlr_layer_shell_v1_get_layer_surface(
         o->w->layer_shell, o->surface, o->output,
-        o->w->layer, "background");
+        o->w->layer, "vibepaper");
     zwlr_layer_surface_v1_set_anchor(o->layer_surface,
         ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
         ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
@@ -499,19 +499,19 @@ bg_wayland *bg_wayland_init(void) {
     bg_wayland *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
 
-    const char *env = getenv("BG_FADE_MS");
+    const char *env = getenv("VIBEPAPER_FADE_MS");
     w->fade_ms = env ? (unsigned)strtoul(env, NULL, 10) : DEFAULT_FADE_MS;
 
     // Layer to render on. Use "bottom" to sit above another wallpaper daemon
     // (e.g. hyprpaper on the "background" layer) but below all windows.
     w->layer = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
-    const char *lenv = getenv("BG_LAYER");
+    const char *lenv = getenv("VIBEPAPER_LAYER");
     if (lenv) {
         if      (!strcmp(lenv, "background")) w->layer = ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND;
         else if (!strcmp(lenv, "bottom"))     w->layer = ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM;
         else if (!strcmp(lenv, "top"))        w->layer = ZWLR_LAYER_SHELL_V1_LAYER_TOP;
         else if (!strcmp(lenv, "overlay"))    w->layer = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
-        else LOG_WARN("unknown BG_LAYER '%s' — using 'background'", lenv);
+        else LOG_WARN("unknown VIBEPAPER_LAYER '%s' — using 'background'", lenv);
     }
 
     w->display = wl_display_connect(NULL);
