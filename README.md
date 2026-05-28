@@ -66,10 +66,12 @@ Key design points:
 | `src/main.c`    | CLI parsing, client requests, daemon auto-spawn            |
 | `src/daemon.c`  | Event loop, command dispatch, generation queue + worker    |
 | `src/wayland.c` | Layer-shell surfaces, SHM buffer pool, crossfade, viewport |
-| `src/openai.c`  | OpenAI image generate + edit client (libcurl + cJSON + b64) |
+| `src/imagegen.c`| Provider-agnostic image generate/edit; `openai`/`gemini`/`stability` wire schemes (libcurl + cJSON + b64) |
+| `src/provider.c`| Provider presets, JSON config, per-provider API-key resolution |
 | `src/image.c`   | Decode / cover-fit / blit (stb)                            |
 | `src/store.c`   | History store (save, list, restore, prune)                 |
 | `src/ipc.c`     | UNIX-socket JSON line protocol                             |
+| `tests/`        | Offline unit tests for the scheme builders/parsers (`make test`) |
 | `protocols/`    | Vendored `wlr-layer-shell` XML + generated glue            |
 | `third_party/`  | Vendored `stb_image` / `stb_image_resize2`                 |
 
@@ -559,6 +561,86 @@ send commands. Specifically:
   redirects. Your API key is sent only to the configured provider's endpoint
   (the built-in presets point at each vendor's official API host); keep your key
   files `chmod 600`.
+
+---
+
+## Contributing
+
+Contributions are welcome — bug fixes, new providers, rendering tweaks, docs.
+
+### Set up
+
+```sh
+sudo pacman -S --needed base-devel wayland wayland-protocols cjson curl pkgconf
+git clone https://github.com/maxischmaxi/vibepaper
+cd vibepaper
+make          # builds ./vibepaper
+make test     # offline unit tests for the scheme builders/parsers (ASan + UBSan)
+```
+
+`stb` and the `wlr-layer-shell` protocol are vendored (`third_party/`,
+`protocols/`), so there's nothing else to fetch. See
+[How it works](#how-it-works) and [Source layout](#source-layout) for the lay of
+the land — it's a single binary that acts as both the daemon and a thin IPC
+client over a UNIX socket.
+
+### Dev loop
+
+The daemon is normally autostarted by your compositor, so while hacking, run it
+yourself to watch the logs:
+
+```sh
+make
+vibepaper --stop          # stop the running (old) daemon, if any
+vibepaper daemon          # run in the foreground; Ctrl-C to quit
+# …then, in another terminal:
+vibepaper --color 1e1e2e  # no API key needed
+vibepaper generate "test prompt"
+```
+
+Any client command auto-spawns a daemon if none is listening. A live daemon
+keeps running the old binary until you `--stop` it. You **don't** need an API
+key to work on most of the code: `make test`, `--color`, `--file`, `list`,
+`restore` and `providers` all run offline.
+
+### Sanitizers
+
+`make test` already runs under AddressSanitizer + UBSan. To exercise the whole
+binary under sanitizers (it caught a real base64 UB bug during development):
+
+```sh
+make clean
+CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' make
+```
+
+### Adding an image provider
+
+- **An OpenAI-compatible API** (same `/images/generations` shape): just add a
+  row to the `PRESETS[]` table in `src/provider.c` — `name`, `scheme =
+  BG_SCHEME_OPENAI`, `base_url`, default model, auth header/prefix, env var. No
+  other code changes. (Users can also do this purely via `config.json` or
+  `--base-url`/`--scheme` with no rebuild.)
+- **A new wire scheme** (different request/response shape): add a `BG_SCHEME_*`
+  value in `src/imagegen.h`, a `build_*`/`*_parse` pair plus a `case` in
+  `bg_imagegen()` in `src/imagegen.c`, and wire up `bg_scheme_from_string` /
+  `bg_scheme_to_string` / scheme defaults in `src/provider.c`. Add a parser test
+  to `tests/parse_test.c`.
+
+### Conventions
+
+- C11, built with `-Wall -Wextra`; match the surrounding style. Internal symbols
+  use the `bg_`/`BG_` prefix.
+- Keep the security posture: never shell out, validate anything that becomes a
+  filesystem path, keep TLS verification on, don't follow redirects, and never
+  accept API keys on the command line.
+- Avoid pulling in new dependencies casually — vendor small things under
+  `third_party/` like `stb`.
+
+### Submitting
+
+Branch, make sure `make` is warning-free and `make test` passes, then open a PR.
+Tagged releases (`vX.Y.Z`) are built, tested and published to the AUR
+automatically — see [Releasing](#releasing-maintainer).
 
 ---
 
