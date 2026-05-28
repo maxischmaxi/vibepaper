@@ -1,0 +1,49 @@
+# Maintainer: maxischmaxi <max@jeschek.dev>
+#
+# Builds the latest main branch from GitHub. For a stable, versioned package
+# create git tags (e.g. v0.1.0) and switch `source` to the release tarball.
+
+pkgname=vibepaper-git
+_pkgname=vibepaper
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Wayland layer-shell wallpaper daemon that generates and refines wallpapers via the OpenAI image API"
+arch=('x86_64')
+url="https://github.com/maxischmaxi/vibepaper"
+license=('MIT')
+depends=('wayland' 'curl' 'cjson')
+makedepends=('git' 'wayland-protocols' 'pkgconf')
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source=("$_pkgname::git+https://github.com/maxischmaxi/vibepaper.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "$srcdir/$_pkgname"
+	# 0.1.0.r<commits>.g<short-hash> — sortable and unique per commit.
+	printf '0.1.0.r%s.g%s' \
+		"$(git rev-list --count HEAD)" \
+		"$(git rev-parse --short HEAD)"
+}
+
+build() {
+	cd "$srcdir/$_pkgname"
+	make
+}
+
+package() {
+	cd "$srcdir/$_pkgname"
+	# PREFIX=/usr → /usr/bin/vibepaper; DESTDIR stages into the package root.
+	make PREFIX=/usr DESTDIR="$pkgdir" install
+
+	# Optional systemd user service for non-Hyprland Wayland sessions
+	# (sway, river, …). Enable with: systemctl --user enable --now vibepaper
+	install -Dm644 packaging/vibepaper.service \
+		"$pkgdir/usr/lib/systemd/user/vibepaper.service"
+
+	install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+
+	if [ -f LICENSE ]; then
+		install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+	fi
+}

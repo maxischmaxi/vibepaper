@@ -460,6 +460,7 @@ static void registry_global(void *data, struct wl_registry *reg,
         w->viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (strcmp(iface, wl_output_interface.name) == 0) {
         bg_output_state *o = calloc(1, sizeof(*o));
+        if (!o) { LOG_ERR("registry: out of memory adding output"); return; }
         o->w = w;
         o->global_name = name;
         uint32_t ver = version < 4 ? version : 4;

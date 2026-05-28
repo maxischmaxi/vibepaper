@@ -526,6 +526,13 @@ int bg_daemon_run(void) {
             if (cn < 0) {
                 LOG_WARN("accept: %s", strerror(errno));
             } else {
+                // Bound how long a client can stall the single-threaded event
+                // loop: bg_ipc_read_line() reads the request synchronously here,
+                // so a peer that connects and sends a partial line without a
+                // trailing newline would otherwise freeze rendering, frame
+                // callbacks and worker completion indefinitely. With a recv
+                // timeout the read fails fast and we drop the connection.
+                bg_ipc_set_timeouts(cn, 5000, 5000);
                 if (client_fd >= 0) close(client_fd);
                 client_fd = cn;
             }

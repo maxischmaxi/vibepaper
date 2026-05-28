@@ -92,6 +92,53 @@ This produces the `vibepaper` binary. `make clean` removes objects;
 
 ---
 
+## Install
+
+### From the AUR (Arch / Hyprland / wlroots)
+
+A `vibepaper-git` package is in `packaging/PKGBUILD`. To build and install it:
+
+```sh
+cd packaging
+makepkg -si
+```
+
+This pulls the latest `main`, builds it and installs `/usr/bin/vibepaper` plus a
+systemd user service. Runtime dependencies (`wayland`, `curl`, `cjson`) are
+pulled in automatically. Once it is published on the AUR you will be able to
+`yay -S vibepaper-git` (or any AUR helper) directly.
+
+vibepaper is MIT-licensed (see `LICENSE`); the package installs it to
+`/usr/share/licenses/vibepaper/`.
+
+### From source
+
+```sh
+make
+sudo make install PREFIX=/usr          # → /usr/bin/vibepaper
+# or, without root, into your home:
+make install                            # → ~/.local/bin/vibepaper (PREFIX=$HOME/.local)
+```
+
+`make uninstall` (with the same `PREFIX`) removes it again.
+
+### Autostart
+
+On **Hyprland**, add an `exec-once` line (see
+[Autostart](#autostart-replacing-your-wallpaper-tool-on-hyprland) below).
+
+On **other Wayland sessions** (sway, river, …), the package ships a systemd user
+service that starts the daemon with your graphical session:
+
+```sh
+systemctl --user enable --now vibepaper.service
+```
+
+Use **either** the `exec-once` line **or** the systemd service, not both — a
+second daemon detects the first one on the socket and exits.
+
+---
+
 ## Usage
 
 ```
@@ -334,3 +381,27 @@ chmod 600 ~/.config/vibepaper/api_key
   threshold in `src/wayland.c`, or set `VIBEPAPER_FADE_MS=0`, to avoid this.
 - Requires a compositor implementing `wlr-layer-shell`. `wp_viewporter` is
   optional; without it, crossfades run at full resolution.
+
+### Security model
+
+The daemon is a per-user process: its control socket lives in
+`$XDG_RUNTIME_DIR` (mode `0600`, owned by you), so only your own session can
+send commands. Specifically:
+
+- **No shell is ever invoked** — prompts and arguments are passed to OpenAI as
+  JSON / multipart form fields, never to a shell, so prompt or command text
+  cannot inject anything.
+- **History ids are validated** (`restore`, `refine --from`) and cannot escape
+  the cache directory via `../` or other path tricks.
+- **Client requests are time-bounded**, so a stalled or malicious local client
+  cannot freeze the rendering loop.
+- API requests use TLS with certificate verification and never follow
+  redirects. Your API key is read from env or `~/.config/vibepaper/api_key`
+  (keep it `chmod 600`) and is only ever sent to `api.openai.com`.
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). The vendored `stb` headers in `third_party/`
+are public domain / MIT (each carries its own notice).

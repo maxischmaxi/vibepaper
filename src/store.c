@@ -105,7 +105,7 @@ static char *read_file_str(const char *path) {
     return buf;
 }
 
-static void make_id(char *out, size_t out_len) {
+static int make_id(char *out, size_t out_len) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
@@ -117,8 +117,29 @@ static void make_id(char *out, size_t out_len) {
         else        snprintf(out, out_len, "%s-%d", base, i);
         char probe[BG_PATH_MAX];
         snprintf(probe, sizeof(probe), "%s/%s.json", g_dir, out);
-        if (access(probe, F_OK) != 0) return;
+        if (access(probe, F_OK) != 0) return 0;
     }
+    // 1000 collisions in one second is implausible, but never silently reuse an
+    // id (that would overwrite an existing entry's image + metadata).
+    return -1;
+}
+
+// Reject ids that could compose an unexpected filesystem path. Generated ids
+// are timestamp-based ("YYYYMMDD-HHMMSS[-N]"); we accept the slightly broader
+// [A-Za-z0-9._-] but forbid empty, overlong, separators and "..". This is the
+// single choke point that turns an id into a path, so validating here protects
+// `restore`, `refine --from <id>` and the persisted "current" marker against
+// path-traversal (e.g. id "../../../etc/passwd").
+static bool id_is_safe(const char *id) {
+    if (!id || !*id) return false;
+    if (strlen(id) >= BG_ID_MAX) return false;
+    for (const char *p = id; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return strstr(id, "..") == NULL;
 }
 
 // ---------- add ----------
@@ -130,7 +151,10 @@ int bg_store_add(const uint8_t *data, size_t len, const char *ext,
     if (bg_store_init() < 0) return -1;
 
     char id[BG_ID_MAX];
-    make_id(id, sizeof(id));
+    if (make_id(id, sizeof(id)) != 0) {
+        LOG_ERR("store: could not allocate a unique id");
+        return -1;
+    }
 
     char img_path[BG_PATH_MAX], meta_path[BG_PATH_MAX];
     snprintf(img_path,  sizeof(img_path),  "%s/%s.%s", g_dir, id, ext ? ext : "png");
@@ -189,6 +213,7 @@ static int parse_entry(const char *meta_path, bg_store_entry *e) {
 }
 
 int bg_store_get(const char *id, bg_store_entry *out) {
+    if (!id_is_safe(id)) { LOG_WARN("store: rejecting unsafe id"); return -1; }
     if (bg_store_init() < 0) return -1;
     char meta_path[BG_PATH_MAX];
     snprintf(meta_path, sizeof(meta_path), "%s/%s.json", g_dir, id);

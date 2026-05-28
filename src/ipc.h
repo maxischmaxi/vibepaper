@@ -27,4 +27,9 @@ int bg_ipc_read_line(int fd, char **out);
 // Write a single response line ("…\n" is appended automatically). Returns 0/-1.
 int bg_ipc_write_line(int fd, const char *s);
 
+// Apply receive/send timeouts (milliseconds; <= 0 leaves the default) to a
+// connected socket so a stalled peer can neither block the daemon's single-
+// threaded event loop nor hang the CLI forever. Best-effort (errors ignored).
+void bg_ipc_set_timeouts(int fd, int recv_ms, int send_ms);
+
 #endif

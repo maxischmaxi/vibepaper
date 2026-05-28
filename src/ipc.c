@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -24,10 +25,32 @@ int bg_ipc_socket_path(char *out, size_t out_len) {
     return 0;
 }
 
+void bg_ipc_set_timeouts(int fd, int recv_ms, int send_ms) {
+    if (recv_ms > 0) {
+        struct timeval tv = { .tv_sec = recv_ms / 1000, .tv_usec = (recv_ms % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+    if (send_ms > 0) {
+        struct timeval tv = { .tv_sec = send_ms / 1000, .tv_usec = (send_ms % 1000) * 1000 };
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+}
+
 int bg_ipc_server_listen(void) {
     char path[PATH_MAX];
     if (bg_ipc_socket_path(path, sizeof(path)) < 0) {
         LOG_ERR("ipc: socket path too long");
+        return -1;
+    }
+
+    // Refuse to touch an existing path we don't exclusively own. The socket
+    // lives under XDG_RUNTIME_DIR (0700, ours) normally, but the /tmp fallback
+    // path is predictable; a hostile pre-created file or socket there must not
+    // be probed, unlinked or bound over. lstat (not stat) also rejects a
+    // dangling/again-pointing symlink planted at the path.
+    struct stat st;
+    if (lstat(path, &st) == 0 && (!S_ISSOCK(st.st_mode) || st.st_uid != getuid())) {
+        LOG_ERR("ipc: refusing %s — not a socket owned by this user", path);
         return -1;
     }
 
@@ -68,7 +91,13 @@ int bg_ipc_server_listen(void) {
         }
         memcpy(addr.sun_path, path, plen + 1);
     }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    // Create the socket node with no group/other access from the start, closing
+    // the window between bind() and the chmod() below. umask is process-global
+    // but only the main thread runs at listen time (no worker spawned yet).
+    mode_t old_umask = umask(0077);
+    int bind_rc = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    umask(old_umask);
+    if (bind_rc < 0) {
         LOG_ERR("bind(%s): %s", path, strerror(errno));
         close(fd);
         return -1;
@@ -105,6 +134,10 @@ int bg_ipc_client_connect(void) {
         errno = e;
         return -1;
     }
+    // Bound a blocking read of the daemon's reply so the CLI can't hang forever
+    // if the daemon wedges. Generous (well past the 180s OpenAI timeout) since
+    // the progress path uses poll() and never blocks on these reads anyway.
+    bg_ipc_set_timeouts(fd, 200000, 30000);
     return fd;
 }
 
