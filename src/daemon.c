@@ -1,13 +1,14 @@
 // Daemon: owns the Wayland session and an IPC server. Image generation runs on
 // a worker thread so the compositor event loop stays responsive during the
-// (slow) OpenAI call. The worker signals completion through an eventfd that the
-// main poll loop watches; all Wayland calls stay on the main thread.
+// (slow) provider call. The worker signals completion through an eventfd that
+// the main poll loop watches; all Wayland calls stay on the main thread.
 
 #include "daemon.h"
 #include "image.h"
+#include "imagegen.h"
 #include "ipc.h"
 #include "log.h"
-#include "openai.h"
+#include "provider.h"
 #include "store.h"
 #include "wayland.h"
 
@@ -40,9 +41,10 @@
 typedef struct gen_request {
     struct gen_request *next;
     int   client_fd;        // who to reply to (-1 if gone)
-    char *prompt, *model, *size, *quality;
+    char *prompt, *size, *quality;
     char *output;           // target output name, NULL = all
     char *src_path;         // edit source image; NULL = plain generate
+    bg_provider prov;       // resolved backend (owns its strings incl. api_key)
 } gen_request;
 
 typedef struct {
@@ -51,9 +53,9 @@ typedef struct {
     gen_request req;        // the request currently being processed
 
     // result (filled by worker)
-    bool             ok;
-    bg_openai_result res;
-    char             err[256];
+    bool          ok;
+    bg_gen_result res;
+    char          err[256];
 } gen_job;
 
 typedef struct {
@@ -145,7 +147,10 @@ static int resolve_entry(const char *arg, bg_store_entry *out) {
             idx = (size_t)v - 1;
         }
         *out = list[idx];
+        // Transfer ownership of every heap field so bg_store_free_list won't
+        // double-free them. MUST list every malloc'd member of bg_store_entry.
         list[idx].prompt = list[idx].model = list[idx].size = list[idx].quality = NULL;
+        list[idx].provider = list[idx].base_url = list[idx].scheme = NULL;
         bg_store_free_list(list, n);
         return 0;
     }
@@ -157,15 +162,22 @@ static int resolve_entry(const char *arg, bg_store_entry *out) {
 static void *gen_worker(void *arg) {
     daemon_ctx *ctx = arg;
     gen_job *j = &ctx->job;
-    bg_openai_opts opts = { .model = j->req.model, .size = j->req.size, .quality = j->req.quality };
-    if (j->req.src_path) {
-        reply_progress(j->req.client_fd, "Refining image with OpenAI");
-        j->ok = bg_openai_edit(j->req.src_path, j->req.prompt, &opts, &j->res);
-    } else {
-        reply_progress(j->req.client_fd, "Generating image with OpenAI");
-        j->ok = bg_openai_generate(j->req.prompt, &opts, &j->res);
-    }
-    if (!j->ok) snprintf(j->err, sizeof(j->err), "openai request failed (see daemon log)");
+    // The provider was fully resolved (incl. key) on the main thread; the worker
+    // only performs the (slow) network call.
+    bg_gen_opts opts = {
+        .scheme            = j->req.prov.scheme,
+        .provider          = j->req.prov.name,
+        .base_url          = j->req.prov.base_url,
+        .model             = j->req.prov.model,
+        .size              = j->req.size,
+        .quality           = j->req.quality,
+        .api_key           = j->req.prov.api_key,
+        .auth_header_name  = j->req.prov.auth_header_name,
+        .auth_value_prefix = j->req.prov.auth_value_prefix,
+    };
+    reply_progress(j->req.client_fd, j->req.src_path ? "Refining image" : "Generating image");
+    j->ok = bg_imagegen(&opts, j->req.prompt, j->req.src_path, &j->res);
+    if (!j->ok) snprintf(j->err, sizeof(j->err), "image request failed (see daemon log)");
     else reply_progress(j->req.client_fd, "Image received");
 
     uint64_t one = 1;
@@ -175,30 +187,35 @@ static void *gen_worker(void *arg) {
 }
 
 static void request_free_fields(gen_request *r) {
-    free(r->prompt); free(r->model); free(r->size); free(r->quality);
+    free(r->prompt); free(r->size); free(r->quality);
     free(r->output); free(r->src_path);
-    r->prompt = r->model = r->size = r->quality = r->output = r->src_path = NULL;
+    bg_provider_clear(&r->prov);
+    r->prompt = r->size = r->quality = r->output = r->src_path = NULL;
 }
 
-// Allocate a request with copies of the given fields. `src_path` non-NULL marks
-// this as an edit ("refine") of that image rather than a fresh generation.
-static gen_request *request_new(int client_fd, const char *prompt, const char *model,
+// Allocate a request with copies of prompt/size/quality/output/src_path and
+// MOVE the already-resolved provider into it (on success *prov is zeroed so the
+// caller's bg_provider_clear becomes a no-op). On allocation failure returns
+// NULL and leaves *prov untouched for the caller to clear. `src_path` non-NULL
+// marks this as an edit ("refine") rather than a fresh generation.
+static gen_request *request_new(int client_fd, const char *prompt, bg_provider *prov,
                                 const char *size, const char *quality, const char *output,
                                 const char *src_path) {
     gen_request *r = calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->client_fd = client_fd;
     r->prompt   = strdup(prompt);
-    r->model    = model    ? strdup(model)    : NULL;
     r->size     = size     ? strdup(size)     : NULL;
     r->quality  = quality  ? strdup(quality)  : NULL;
     r->output   = output   ? strdup(output)   : NULL;
     r->src_path = src_path ? strdup(src_path) : NULL;
+    r->prov = *prov;                  // move ownership of the resolved provider
+    memset(prov, 0, sizeof(*prov));
     return r;
 }
 
 static void job_clear(gen_job *j) {
-    bg_openai_free_result(&j->res);
+    bg_imagegen_free_result(&j->res);
     request_free_fields(&j->req);
     memset(j, 0, sizeof(*j));
     j->req.client_fd = -1;
@@ -265,10 +282,12 @@ static void gen_complete(daemon_ctx *ctx) {
     } else {
         reply_progress(cfd, "Rendering wallpaper");
         char id[BG_ID_MAX] = {0};
-        bg_store_add(j->res.data, j->res.len, "png", j->req.prompt,
-                     j->req.model   ? j->req.model   : BG_OPENAI_DEFAULT_MODEL,
-                     j->req.size    ? j->req.size    : BG_OPENAI_DEFAULT_SIZE,
-                     j->req.quality ? j->req.quality : BG_OPENAI_DEFAULT_QUALITY,
+        // Persist the backend actually used so `refine`/`restore`+`refine`
+        // reproduce against the same provider/model.
+        bg_store_add(j->res.data, j->res.len, j->res.ext ? j->res.ext : "png",
+                     j->req.prompt, j->req.prov.model, j->req.size, j->req.quality,
+                     j->req.prov.name, j->req.prov.base_url,
+                     bg_scheme_to_string(j->req.prov.scheme),
                      id, sizeof(id));
 
         bg_image img = {0};
@@ -319,6 +338,35 @@ static void submit_request(daemon_ctx *ctx, int client_fd, gen_request *r, bool 
     }
 }
 
+static const char *jstr(const cJSON *v) {
+    return cJSON_IsString(v) ? v->valuestring : NULL;
+}
+
+// Resolve a provider from optional overrides (any may be NULL). On failure it
+// replies an error to the client and returns -1. On success *prov is filled and
+// owned by the caller (free with bg_provider_clear, or move via request_new).
+static int resolve_provider_or_reply(int client_fd, const char *cmd,
+                                     const char *provider, const char *base_url,
+                                     const char *scheme, const char *model,
+                                     bg_provider *prov) {
+    if (bg_provider_resolve(provider, base_url, scheme, model, prov) != 0) {
+        char m[160];
+        snprintf(m, sizeof(m), "%s: could not resolve provider (see daemon log)", cmd);
+        reply_err(client_fd, m);
+        return -1;
+    }
+    if (!prov->api_key) {
+        char m[256];
+        snprintf(m, sizeof(m), "%s: no API key for provider '%s' — set it in "
+                 "config.json, an env var, or ~/.config/vibepaper/keys/%s",
+                 cmd, prov->name, prov->name);
+        reply_err(client_fd, m);
+        bg_provider_clear(prov);
+        return -1;
+    }
+    return 0;
+}
+
 // Returns true if client_fd was handed to an async job (caller must NOT close).
 static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
     bg_wayland *w = ctx->w;
@@ -358,26 +406,31 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
             reply_ok(client_fd);
         }
     } else if (strcmp(c, "generate") == 0) {
-        const cJSON *prompt  = cJSON_GetObjectItem(root, "prompt");
-        const cJSON *size    = cJSON_GetObjectItem(root, "size");
-        const cJSON *quality = cJSON_GetObjectItem(root, "quality");
-        const cJSON *model   = cJSON_GetObjectItem(root, "model");
+        const cJSON *prompt = cJSON_GetObjectItem(root, "prompt");
         if (!cJSON_IsString(prompt)) {
             reply_err(client_fd, "generate: missing prompt");
         } else {
-            gen_request *r = request_new(client_fd, prompt->valuestring,
-                                 cJSON_IsString(model)   ? model->valuestring   : NULL,
-                                 cJSON_IsString(size)    ? size->valuestring    : NULL,
-                                 cJSON_IsString(quality) ? quality->valuestring : NULL,
-                                 out, NULL);
-            submit_request(ctx, client_fd, r, &fd_taken);
+            bg_provider prov;
+            if (resolve_provider_or_reply(client_fd, "generate",
+                    jstr(cJSON_GetObjectItem(root, "provider")),
+                    jstr(cJSON_GetObjectItem(root, "base_url")),
+                    jstr(cJSON_GetObjectItem(root, "scheme")),
+                    jstr(cJSON_GetObjectItem(root, "model")), &prov) == 0) {
+                const char *eff_size    = jstr(cJSON_GetObjectItem(root, "size"));
+                const char *eff_quality = jstr(cJSON_GetObjectItem(root, "quality"));
+                if (prov.scheme == BG_SCHEME_OPENAI) {
+                    if (!eff_size)    eff_size    = BG_DEFAULT_SIZE;
+                    if (!eff_quality) eff_quality = BG_DEFAULT_QUALITY;
+                }
+                gen_request *r = request_new(client_fd, prompt->valuestring, &prov,
+                                             eff_size, eff_quality, out, NULL);
+                if (!r) bg_provider_clear(&prov);
+                submit_request(ctx, client_fd, r, &fd_taken);
+            }
         }
     } else if (strcmp(c, "refine") == 0) {
-        const cJSON *prompt  = cJSON_GetObjectItem(root, "prompt");
-        const cJSON *srcv    = cJSON_GetObjectItem(root, "src");
-        const cJSON *size    = cJSON_GetObjectItem(root, "size");
-        const cJSON *quality = cJSON_GetObjectItem(root, "quality");
-        const cJSON *model   = cJSON_GetObjectItem(root, "model");
+        const cJSON *prompt = cJSON_GetObjectItem(root, "prompt");
+        const cJSON *srcv   = cJSON_GetObjectItem(root, "src");
         if (!cJSON_IsString(prompt)) {
             reply_err(client_fd, "refine: missing prompt");
         } else {
@@ -396,16 +449,25 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
                               ? "refine: no such source entry"
                               : "refine: no current wallpaper to refine");
             } else {
-                // Default the output size to the source's size so the wallpaper
-                // format stays stable across refinements (unless overridden).
-                const char *eff_size = cJSON_IsString(size) ? size->valuestring
-                                     : (e.size ? e.size : NULL);
-                gen_request *r = request_new(client_fd, prompt->valuestring,
-                                     cJSON_IsString(model)   ? model->valuestring   : NULL,
-                                     eff_size,
-                                     cJSON_IsString(quality) ? quality->valuestring : NULL,
-                                     out, e.path);
-                submit_request(ctx, client_fd, r, &fd_taken);
+                // Inherit the source entry's backend + format unless overridden,
+                // so a refine (and restore+refine chains) hits the same provider.
+                const char *p_provider = jstr(cJSON_GetObjectItem(root, "provider")); if (!p_provider) p_provider = e.provider;
+                const char *p_base     = jstr(cJSON_GetObjectItem(root, "base_url")); if (!p_base)     p_base     = e.base_url;
+                const char *p_scheme   = jstr(cJSON_GetObjectItem(root, "scheme"));   if (!p_scheme)   p_scheme   = e.scheme;
+                const char *p_model    = jstr(cJSON_GetObjectItem(root, "model"));    if (!p_model)    p_model    = e.model;
+                bg_provider prov;
+                if (resolve_provider_or_reply(client_fd, "refine", p_provider, p_base, p_scheme, p_model, &prov) == 0) {
+                    const char *eff_size    = jstr(cJSON_GetObjectItem(root, "size"));    if (!eff_size)    eff_size    = e.size;
+                    const char *eff_quality = jstr(cJSON_GetObjectItem(root, "quality")); if (!eff_quality) eff_quality = e.quality;
+                    if (prov.scheme == BG_SCHEME_OPENAI) {
+                        if (!eff_size)    eff_size    = BG_DEFAULT_SIZE;
+                        if (!eff_quality) eff_quality = BG_DEFAULT_QUALITY;
+                    }
+                    gen_request *r = request_new(client_fd, prompt->valuestring, &prov,
+                                                 eff_size, eff_quality, out, e.path);
+                    if (!r) bg_provider_clear(&prov);
+                    submit_request(ctx, client_fd, r, &fd_taken);
+                }
                 bg_store_entry_clear(&e);
             }
         }
@@ -458,24 +520,24 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
 // ---------- main loop ----------
 
 int bg_daemon_run(void) {
-    bg_openai_global_init();
+    bg_imagegen_global_init();
 
     daemon_ctx ctx = {0};
     ctx.running = true;
     ctx.job.req.client_fd = -1;
 
     ctx.w = bg_wayland_init();
-    if (!ctx.w) { bg_openai_global_cleanup(); return 1; }
+    if (!ctx.w) { bg_imagegen_global_cleanup(); return 1; }
 
     ctx.listen_fd = bg_ipc_server_listen();
-    if (ctx.listen_fd < 0) { bg_wayland_destroy(ctx.w); bg_openai_global_cleanup(); return 1; }
+    if (ctx.listen_fd < 0) { bg_wayland_destroy(ctx.w); bg_imagegen_global_cleanup(); return 1; }
 
     ctx.gen_evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (ctx.gen_evfd < 0) {
         LOG_ERR("eventfd: %s", strerror(errno));
         close(ctx.listen_fd);
         bg_wayland_destroy(ctx.w);
-        bg_openai_global_cleanup();
+        bg_imagegen_global_cleanup();
         return 1;
     }
 
@@ -574,7 +636,7 @@ int bg_daemon_run(void) {
     if (bg_ipc_socket_path(path, sizeof(path)) == 0) unlink(path);
 
     bg_wayland_destroy(ctx.w);
-    bg_openai_global_cleanup();
+    bg_imagegen_global_cleanup();
     LOG_INFO("daemon shutdown");
     return 0;
 }

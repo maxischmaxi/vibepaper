@@ -147,6 +147,7 @@ static bool id_is_safe(const char *id) {
 int bg_store_add(const uint8_t *data, size_t len, const char *ext,
                  const char *prompt, const char *model,
                  const char *size, const char *quality,
+                 const char *provider, const char *base_url, const char *scheme,
                  char *out_id, size_t out_id_len) {
     if (bg_store_init() < 0) return -1;
 
@@ -168,10 +169,13 @@ int bg_store_add(const uint8_t *data, size_t len, const char *ext,
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "id", id);
     cJSON_AddStringToObject(o, "file", img_path);
-    if (prompt)  cJSON_AddStringToObject(o, "prompt",  prompt);
-    if (model)   cJSON_AddStringToObject(o, "model",   model);
-    if (size)    cJSON_AddStringToObject(o, "size",    size);
-    if (quality) cJSON_AddStringToObject(o, "quality", quality);
+    if (prompt)   cJSON_AddStringToObject(o, "prompt",   prompt);
+    if (model)    cJSON_AddStringToObject(o, "model",    model);
+    if (size)     cJSON_AddStringToObject(o, "size",     size);
+    if (quality)  cJSON_AddStringToObject(o, "quality",  quality);
+    if (provider) cJSON_AddStringToObject(o, "provider", provider);
+    if (base_url) cJSON_AddStringToObject(o, "base_url", base_url);
+    if (scheme)   cJSON_AddStringToObject(o, "scheme",   scheme);
     cJSON_AddNumberToObject(o, "ts", (double)time(NULL));
     char *js = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
@@ -190,6 +194,27 @@ int bg_store_add(const uint8_t *data, size_t len, const char *ext,
 
 // ---------- get ----------
 
+// Self-heal a stale image path. The sidecar records an absolute path; if the
+// cache directory is later moved or renamed (e.g. the 2026 "background" →
+// "vibepaper" rename), that path stops existing even though the image is still
+// present under the new cache dir with the same basename. When the recorded
+// path is missing but "<cache-dir>/<basename>" exists, repair e->path to it so
+// old history keeps working (startup restore, `restore`, `refine`). In-memory
+// only — the sidecar is not rewritten. No-op when the recorded path is valid.
+static void repair_entry_path(bg_store_entry *e) {
+    if (e->path[0] == '\0' || access(e->path, F_OK) == 0) return;
+    const char *slash = strrchr(e->path, '/');
+    const char *base = slash ? slash + 1 : e->path;
+    if (*base == '\0') return;
+    char cand[BG_PATH_MAX];
+    int n = snprintf(cand, sizeof(cand), "%s/%s", g_dir, base);
+    if (n < 0 || (size_t)n >= sizeof(cand)) return;
+    if (access(cand, F_OK) == 0) {
+        LOG_INFO("store: repairing stale path for %s → %s", e->id[0] ? e->id : "?", cand);
+        snprintf(e->path, sizeof(e->path), "%s", cand);
+    }
+}
+
 static int parse_entry(const char *meta_path, bg_store_entry *e) {
     char *js = read_file_str(meta_path);
     if (!js) return -1;
@@ -207,8 +232,12 @@ static int parse_entry(const char *meta_path, bg_store_entry *e) {
     if ((v = cJSON_GetObjectItem(o, "model"))   && cJSON_IsString(v)) e->model   = strdup(v->valuestring);
     if ((v = cJSON_GetObjectItem(o, "size"))    && cJSON_IsString(v)) e->size    = strdup(v->valuestring);
     if ((v = cJSON_GetObjectItem(o, "quality")) && cJSON_IsString(v)) e->quality = strdup(v->valuestring);
+    if ((v = cJSON_GetObjectItem(o, "provider")) && cJSON_IsString(v)) e->provider = strdup(v->valuestring);
+    if ((v = cJSON_GetObjectItem(o, "base_url")) && cJSON_IsString(v)) e->base_url = strdup(v->valuestring);
+    if ((v = cJSON_GetObjectItem(o, "scheme"))   && cJSON_IsString(v)) e->scheme   = strdup(v->valuestring);
     if ((v = cJSON_GetObjectItem(o, "ts")) && cJSON_IsNumber(v)) e->ts = (long)v->valuedouble;
     cJSON_Delete(o);
+    repair_entry_path(e);
     return 0;
 }
 
@@ -223,7 +252,9 @@ int bg_store_get(const char *id, bg_store_entry *out) {
 void bg_store_entry_clear(bg_store_entry *e) {
     if (!e) return;
     free(e->prompt); free(e->model); free(e->size); free(e->quality);
+    free(e->provider); free(e->base_url); free(e->scheme);
     e->prompt = e->model = e->size = e->quality = NULL;
+    e->provider = e->base_url = e->scheme = NULL;
 }
 
 void bg_store_free_list(bg_store_entry *list, size_t count) {

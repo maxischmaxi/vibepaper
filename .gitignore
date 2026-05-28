@@ -1,4 +1,5 @@
 vibepaper
+parse_test
 *.o
 protocols/*-client-protocol.h
 protocols/*-protocol.c

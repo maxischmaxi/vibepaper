@@ -14,6 +14,9 @@ typedef struct {
     char *model;
     char *size;
     char *quality;
+    char *provider;      // backend provider name (NULL for pre-multi-provider entries)
+    char *base_url;      // resolved endpoint base (NULL → provider/scheme default)
+    char *scheme;        // wire scheme ("openai"/"gemini"/"stability"); NULL → openai
     char  path[BG_PATH_MAX]; // absolute path to the image file
     long  ts;            // unix timestamp
 } bg_store_entry;
@@ -30,6 +33,7 @@ const char *bg_store_dir(void);
 int bg_store_add(const uint8_t *data, size_t len, const char *ext,
                  const char *prompt, const char *model,
                  const char *size, const char *quality,
+                 const char *provider, const char *base_url, const char *scheme,
                  char *out_id, size_t out_id_len);
 
 // Look up a single entry by exact id. Returns 0 / -1.

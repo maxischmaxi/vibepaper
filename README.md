@@ -143,13 +143,14 @@ second daemon detects the first one on the socket and exits.
 
 ```
 vibepaper daemon                                  run the renderer + IPC server
-vibepaper generate "prompt" [--size S] [--quality Q] [--model M] [--output NAME]
-vibepaper refine   "prompt" [--from ID|INDEX|last] [--size S] [--quality Q] [--output NAME]
+vibepaper generate "prompt" [--provider P] [--model M] [--size S] [--quality Q] [--base-url URL] [--scheme S] [--output NAME]
+vibepaper refine   "prompt" [--from ID|INDEX|last] [--provider P] [--model M] [--size S] [--quality Q] [--base-url URL] [--scheme S] [--output NAME]
 vibepaper --file PATH        [--output NAME]       set a local image
 vibepaper --color RRGGBB     [--output NAME]       set a solid color
 vibepaper list                                    past wallpapers, newest first
 vibepaper restore ID|INDEX|last [--output NAME]    re-display a past wallpaper
 vibepaper current                                 show the active wallpaper
+vibepaper providers                               list configured image providers
 vibepaper outputs                                 list connected outputs
 vibepaper prune [--keep N]                         delete old history (default keep 20)
 vibepaper --stop                                  shut the daemon down
@@ -168,11 +169,17 @@ export OPENAI_API_KEY=sk-…
 vibepaper generate "snowy pine forest at golden hour, wide angle"
 vibepaper generate "abstract liquid gradient, teal and magenta" --quality high
 vibepaper generate "rolling fog over mountains" --size 3840x2160
+vibepaper generate "neon tokyo alley" --provider gemini   # use another backend
 ```
+
+By default this uses OpenAI's `gpt-image-2`. Switch the model with `--model`
+(e.g. `--model gpt-image-1`) or the whole backend with `--provider` — see
+[Providers](#providers) below.
 
 `gpt-image-2` sizes: `auto`, `1024x1024`, `1536x1024` (default), `1024x1536`,
 `2048x2048`, `2048x1152`, `3840x2160`, `2160x3840`.
 Qualities: `low`, `medium` (default), `high`, `auto`.
+(Other providers interpret size/quality differently — see below.)
 
 ### Refining (iterating on an image)
 
@@ -198,14 +205,114 @@ vibepaper refine "make the canoe red"      --from 20260528-091500
 
 Notes:
 
-- The edit goes to `gpt-image-2`, which preserves the input image at high
-  fidelity automatically — small prompts make small changes.
+- With the default OpenAI backend the edit goes to `gpt-image-2`, which
+  preserves the input image at high fidelity automatically — small prompts make
+  small changes.
+- `refine` re-uses the **same provider** that produced the source image (stored
+  in its history metadata), so a refine hits the same backend unless you pass an
+  explicit `--provider`. Refine is supported on the `openai` and `gemini`
+  schemes; the `stability` scheme has no maskless edit endpoint and refuses.
 - Output size defaults to the **source image's size** so the wallpaper format
   stays stable across iterations; override it per call with `--size`.
 - Like `generate`, `refine` queues behind any in-flight job and shows the live
   progress spinner while the daemon works.
 - `--output NAME` refines onto a single monitor only and does not change the
   global `current` (same rule as `generate`/`restore`).
+
+## Providers
+
+vibepaper is not tied to OpenAI. A *provider* is a named backend with a wire
+*scheme* (how requests/responses are shaped), a base URL, a default model and an
+auth header. `vibepaper providers` lists what's available and whether a key is
+currently found:
+
+```
+$ vibepaper providers
+PROVIDER     SCHEME     KEY  MODEL  (base-url)
+openai       openai     yes  gpt-image-2  (https://api.openai.com/v1)
+xai          openai     no   grok-2-image  (https://api.x.ai/v1)
+together     openai     no   black-forest-labs/FLUX.1-schnell-Free  (https://api.together.xyz/v1)
+gemini       gemini     no   gemini-2.5-flash-image  (https://generativelanguage.googleapis.com/v1beta)
+stability    stability  no   core  (https://api.stability.ai)
+```
+
+Pick one per call with `--provider`, and pin a model with `--model`:
+
+```sh
+vibepaper generate "a koi pond at dusk" --provider gemini
+vibepaper generate "retro sci-fi poster" --provider stability --size 3:2
+vibepaper generate "portrait of a fox"  --model gpt-image-1     # still openai
+```
+
+### Built-in schemes
+
+| scheme      | covers (preset)              | size syntax            | quality | refine |
+| ----------- | ---------------------------- | ---------------------- | ------- | ------ |
+| `openai`    | `openai`, `xai`, `together`  | `WxH` (e.g. 1536x1024) | yes     | yes    |
+| `gemini`    | `gemini`                     | `1K` / `2K` / `4K`     | —       | yes    |
+| `stability` | `stability`                  | aspect, e.g. `16:9`    | —       | no     |
+
+The `openai` scheme also covers any OpenAI-compatible API — Azure OpenAI,
+OpenRouter, local servers, … — by overriding the base URL. Anything not listed
+can be reached with the escape hatch:
+
+```sh
+vibepaper generate "a lighthouse" \
+  --scheme openai --base-url https://my-host/v1 --model my-model
+```
+
+> Image *generation* providers only. Anthropic/Claude is not listed because it
+> has no image-generation API (it only understands images, it doesn't make them).
+
+### Defining providers in config
+
+For anything you use regularly — custom endpoints, alternate keys, default model
+or quality per provider — add it to `~/.config/vibepaper/config.json`
+(`$XDG_CONFIG_HOME/vibepaper/config.json` if set). The daemon is started by your
+compositor without a shell environment, so this file (and the key files below)
+are how it finds keys.
+
+```json
+{
+  "default_provider": "openai",
+  "providers": {
+    "openai":   { "quality": "high" },
+    "gemini":   { "key_file": "~/.config/vibepaper/keys/gemini" },
+    "my-azure": {
+      "scheme": "openai",
+      "base_url": "https://my-res.openai.azure.com/openai/deployments/gpt-image-1",
+      "model": "gpt-image-1",
+      "auth_header_name": "api-key",
+      "auth_value_prefix": "",
+      "key_file": "~/.config/vibepaper/keys/azure"
+    }
+  }
+}
+```
+
+Each provider object may set any of `scheme`, `base_url`, `model`, `size`,
+`quality`, `auth_header_name`, `auth_value_prefix`, `env_var`, and exactly one of
+`key` (inline, discouraged) or `key_file`. Omitted fields fall back to the
+built-in preset of the same name; a brand-new name must declare at least a
+`scheme`. Built-in default models are convenience defaults that **may drift** as
+providers rename things — pin one with `--model` or the config `model` field.
+
+### Keys
+
+API keys are **never** passed on the command line (they would be visible in the
+process list). For each provider the key is resolved in order:
+
+1. config.json `key` / `key_file` for that provider
+2. the provider's env var: `OPENAI_API_KEY`, `GEMINI_API_KEY`, `STABILITY_API_KEY`,
+   `XAI_API_KEY`, `TOGETHER_API_KEY` (or a custom `env_var`)
+3. `~/.config/vibepaper/keys/<provider>` (first line)
+4. for `openai` only, the legacy `OPENAI_API_KEY_FILE` / `~/.config/vibepaper/api_key`
+
+```sh
+mkdir -p ~/.config/vibepaper/keys
+printf '%s\n' "AIza…" > ~/.config/vibepaper/keys/gemini
+chmod 600 ~/.config/vibepaper/keys/gemini
+```
 
 ### History
 
@@ -343,20 +450,20 @@ Read by the **daemon** at startup (set them before the command that spawns it):
 
 | Variable               | Default      | Meaning                                                             |
 | ---------------------- | ------------ | ------------------------------------------------------------------- |
-| `OPENAI_API_KEY`       | —            | API key for `generate` (see key resolution below).                  |
-| `OPENAI_API_KEY_FILE`  | —            | Path to a file whose first line is the API key.                     |
+| `VIBEPAPER_PROVIDER`   | `openai`     | Default provider when `--provider` is omitted (config wins over this). |
+| `OPENAI_API_KEY`       | —            | API key for the `openai` provider (see [Providers](#providers)).    |
+| `GEMINI_API_KEY` etc.  | —            | Per-provider key env vars (`STABILITY_API_KEY`, `XAI_API_KEY`, …).  |
+| `OPENAI_API_KEY_FILE`  | —            | Legacy: path to a file whose first line is the OpenAI key.          |
 | `VIBEPAPER_LAYER`      | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`.       |
 | `VIBEPAPER_FADE_MS`    | `400`        | Crossfade duration in ms. `0` disables fades.                       |
 | `XDG_CACHE_HOME`       | `~/.cache`   | History lives in `$XDG_CACHE_HOME/vibepaper`.                       |
+| `XDG_CONFIG_HOME`      | `~/.config`  | `config.json` + keys live in `$XDG_CONFIG_HOME/vibepaper`.          |
 | `XDG_RUNTIME_DIR`      | —            | Daemon socket lives here (`vibepaper.sock`); falls back to `/tmp`.  |
 
-### API key resolution
+### API keys
 
-For `generate`, the key is resolved in this order:
-
-1. `OPENAI_API_KEY` environment variable
-2. file named by `OPENAI_API_KEY_FILE`
-3. `~/.config/vibepaper/api_key` (first line)
+Keys are resolved per provider — see [Keys](#keys) under Providers for the full
+order. The short version: config.json → the provider's env var → a key file.
 
 **This matters for autostart.** A daemon launched by your compositor at login
 does *not* inherit your shell's environment, so `OPENAI_API_KEY` from `~/.zshrc`
@@ -364,7 +471,7 @@ won't be visible to it. Put the key in a file instead:
 
 ```sh
 mkdir -p ~/.config/vibepaper
-printf '%s\n' "sk-your-key" > ~/.config/vibepaper/api_key
+printf '%s\n' "sk-your-key" > ~/.config/vibepaper/api_key   # openai (legacy path)
 chmod 600 ~/.config/vibepaper/api_key
 ```
 
@@ -388,16 +495,19 @@ The daemon is a per-user process: its control socket lives in
 `$XDG_RUNTIME_DIR` (mode `0600`, owned by you), so only your own session can
 send commands. Specifically:
 
-- **No shell is ever invoked** — prompts and arguments are passed to OpenAI as
-  JSON / multipart form fields, never to a shell, so prompt or command text
-  cannot inject anything.
+- **No shell is ever invoked** — prompts and arguments are passed to the
+  provider as JSON / multipart form fields, never to a shell, so prompt or
+  command text cannot inject anything.
+- **API keys are never command-line arguments** (they would be visible in the
+  process list); they come only from config.json, env vars or key files.
 - **History ids are validated** (`restore`, `refine --from`) and cannot escape
   the cache directory via `../` or other path tricks.
 - **Client requests are time-bounded**, so a stalled or malicious local client
   cannot freeze the rendering loop.
 - API requests use TLS with certificate verification and never follow
-  redirects. Your API key is read from env or `~/.config/vibepaper/api_key`
-  (keep it `chmod 600`) and is only ever sent to `api.openai.com`.
+  redirects. Your API key is sent only to the configured provider's endpoint
+  (the built-in presets point at each vendor's official API host); keep your key
+  files `chmod 600`.
 
 ---
 

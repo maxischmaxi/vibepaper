@@ -14,6 +14,7 @@
 #include "daemon.h"
 #include "ipc.h"
 #include "log.h"
+#include "provider.h"
 #include "store.h"
 
 #include <cJSON.h>
@@ -34,11 +35,12 @@ static void usage(FILE *f) {
 "  vibepaper daemon\n"
 "  vibepaper --color RRGGBB\n"
 "  vibepaper --file PATH\n"
-"  vibepaper generate \"prompt\" [--size SIZE] [--quality Q] [--model M] [--output NAME]\n"
-"  vibepaper refine \"prompt\" [--from ID|INDEX|last] [--size SIZE] [--quality Q] [--model M] [--output NAME]\n"
+"  vibepaper generate \"prompt\" [--provider P] [--model M] [--size S] [--quality Q] [--base-url URL] [--scheme S] [--output NAME]\n"
+"  vibepaper refine \"prompt\" [--from ID|INDEX|last] [--provider P] [--model M] [--size S] [--quality Q] [--base-url URL] [--scheme S] [--output NAME]\n"
 "  vibepaper list                            # past wallpapers, newest first\n"
 "  vibepaper restore ID|INDEX|last [--output NAME]\n"
 "  vibepaper current                         # show the active wallpaper\n"
+"  vibepaper providers                       # list configured image providers\n"
 "  vibepaper outputs                         # list connected outputs\n"
 "  vibepaper prune [--keep N]                # delete old history (default keep 20)\n"
 "  vibepaper --stop\n"
@@ -47,9 +49,20 @@ static void usage(FILE *f) {
 "--color and --file also accept [--output NAME] to target a single output.\n"
 "Without --output a command applies to all outputs.\n"
 "\n"
-"Sizes (gpt-image-2): auto, 1024x1024, 1536x1024 (default), 1024x1536,\n"
-"                     2048x2048, 2048x1152, 3840x2160, 2160x3840\n"
-"Qualities: low, medium (default), high, auto\n"
+"Providers (image backend):\n"
+"  Built-in: openai (default), xai, together, gemini, stability. Choose with\n"
+"  --provider, or define your own in ~/.config/vibepaper/config.json. The escape\n"
+"  hatch --base-url URL + --scheme {openai|gemini|stability} hits any compatible\n"
+"  API. `vibepaper providers` lists them and whether a key is found.\n"
+"  Keys come from config.json, the provider env var (OPENAI_API_KEY,\n"
+"  GEMINI_API_KEY, STABILITY_API_KEY, XAI_API_KEY, TOGETHER_API_KEY) or\n"
+"  ~/.config/vibepaper/keys/<provider> — NEVER from the command line.\n"
+"\n"
+"Sizes/quality are interpreted per provider:\n"
+"  openai:    size auto|1024x1024|1536x1024 (default)|3840x2160|…; quality low|medium (default)|high|auto\n"
+"  gemini:    size 1K|2K|4K (else provider default); quality ignored\n"
+"  stability: size as an aspect ratio like 16:9|1:1|21:9 (else default); quality ignored\n"
+"Models are overridable defaults that may drift; set --model explicitly to pin one.\n"
 "Crossfade: set VIBEPAPER_FADE_MS (default 400, 0 = instant) before starting the daemon.\n"
 "Layer:     set VIBEPAPER_LAYER=bottom to sit above hyprpaper without disabling it\n"
 "           (background|bottom|top|overlay; default background).\n",
@@ -314,20 +327,33 @@ static int cmd_generate(int argc, char **argv) {
     }
     const char *prompt = argv[0];
     const char *size = NULL, *quality = NULL, *model = NULL, *output = NULL;
+    const char *provider = NULL, *base_url = NULL, *scheme = NULL;
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--size")    && i + 1 < argc) size    = argv[++i];
-        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) quality = argv[++i];
-        else if (!strcmp(argv[i], "--model")   && i + 1 < argc) model   = argv[++i];
-        else if (!strcmp(argv[i], "--output")  && i + 1 < argc) output  = argv[++i];
+        if      (!strcmp(argv[i], "--size")     && i + 1 < argc) size     = argv[++i];
+        else if (!strcmp(argv[i], "--quality")  && i + 1 < argc) quality  = argv[++i];
+        else if (!strcmp(argv[i], "--model")    && i + 1 < argc) model    = argv[++i];
+        else if (!strcmp(argv[i], "--output")   && i + 1 < argc) output   = argv[++i];
+        else if (!strcmp(argv[i], "--provider") && i + 1 < argc) provider = argv[++i];
+        else if (!strcmp(argv[i], "--base-url") && i + 1 < argc) base_url = argv[++i];
+        else if (!strcmp(argv[i], "--scheme")   && i + 1 < argc) scheme   = argv[++i];
+        else if (!strcmp(argv[i], "--key") || !strcmp(argv[i], "--api-key")) {
+            LOG_ERR("API keys are not accepted on the command line (visible in the "
+                    "process list). Use config.json (key_file), an env var, or "
+                    "~/.config/vibepaper/keys/<provider>.");
+            return 2;
+        }
         else { LOG_ERR("unknown flag: %s", argv[i]); return 2; }
     }
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "cmd", "generate");
     cJSON_AddStringToObject(o, "prompt", prompt);
-    if (size)    cJSON_AddStringToObject(o, "size",    size);
-    if (quality) cJSON_AddStringToObject(o, "quality", quality);
-    if (model)   cJSON_AddStringToObject(o, "model",   model);
-    if (output)  cJSON_AddStringToObject(o, "output",  output);
+    if (size)     cJSON_AddStringToObject(o, "size",     size);
+    if (quality)  cJSON_AddStringToObject(o, "quality",  quality);
+    if (model)    cJSON_AddStringToObject(o, "model",    model);
+    if (output)   cJSON_AddStringToObject(o, "output",   output);
+    if (provider) cJSON_AddStringToObject(o, "provider", provider);
+    if (base_url) cJSON_AddStringToObject(o, "base_url", base_url);
+    if (scheme)   cJSON_AddStringToObject(o, "scheme",   scheme);
     return send_request_with_progress(o);
 }
 
@@ -342,22 +368,35 @@ static int cmd_refine(int argc, char **argv) {
     }
     const char *prompt = argv[0];
     const char *from = NULL, *size = NULL, *quality = NULL, *model = NULL, *output = NULL;
+    const char *provider = NULL, *base_url = NULL, *scheme = NULL;
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--from")    && i + 1 < argc) from    = argv[++i];
-        else if (!strcmp(argv[i], "--size")    && i + 1 < argc) size    = argv[++i];
-        else if (!strcmp(argv[i], "--quality") && i + 1 < argc) quality = argv[++i];
-        else if (!strcmp(argv[i], "--model")   && i + 1 < argc) model   = argv[++i];
-        else if (!strcmp(argv[i], "--output")  && i + 1 < argc) output  = argv[++i];
+        if      (!strcmp(argv[i], "--from")     && i + 1 < argc) from     = argv[++i];
+        else if (!strcmp(argv[i], "--size")     && i + 1 < argc) size     = argv[++i];
+        else if (!strcmp(argv[i], "--quality")  && i + 1 < argc) quality  = argv[++i];
+        else if (!strcmp(argv[i], "--model")    && i + 1 < argc) model    = argv[++i];
+        else if (!strcmp(argv[i], "--output")   && i + 1 < argc) output   = argv[++i];
+        else if (!strcmp(argv[i], "--provider") && i + 1 < argc) provider = argv[++i];
+        else if (!strcmp(argv[i], "--base-url") && i + 1 < argc) base_url = argv[++i];
+        else if (!strcmp(argv[i], "--scheme")   && i + 1 < argc) scheme   = argv[++i];
+        else if (!strcmp(argv[i], "--key") || !strcmp(argv[i], "--api-key")) {
+            LOG_ERR("API keys are not accepted on the command line (visible in the "
+                    "process list). Use config.json (key_file), an env var, or "
+                    "~/.config/vibepaper/keys/<provider>.");
+            return 2;
+        }
         else { LOG_ERR("unknown flag: %s", argv[i]); return 2; }
     }
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "cmd", "refine");
     cJSON_AddStringToObject(o, "prompt", prompt);
-    if (from)    cJSON_AddStringToObject(o, "src",     from);
-    if (size)    cJSON_AddStringToObject(o, "size",    size);
-    if (quality) cJSON_AddStringToObject(o, "quality", quality);
-    if (model)   cJSON_AddStringToObject(o, "model",   model);
-    if (output)  cJSON_AddStringToObject(o, "output",  output);
+    if (from)     cJSON_AddStringToObject(o, "src",      from);
+    if (size)     cJSON_AddStringToObject(o, "size",     size);
+    if (quality)  cJSON_AddStringToObject(o, "quality",  quality);
+    if (model)    cJSON_AddStringToObject(o, "model",    model);
+    if (output)   cJSON_AddStringToObject(o, "output",   output);
+    if (provider) cJSON_AddStringToObject(o, "provider", provider);
+    if (base_url) cJSON_AddStringToObject(o, "base_url", base_url);
+    if (scheme)   cJSON_AddStringToObject(o, "scheme",   scheme);
     return send_request_with_progress(o);
 }
 
@@ -407,6 +446,7 @@ static int cmd_current(void) {
     printf("size:    %s\n", e.size ? e.size : "-");
     printf("quality: %s\n", e.quality ? e.quality : "-");
     printf("model:   %s\n", e.model ? e.model : "-");
+    printf("provider:%s\n", e.provider ? e.provider : "openai");
     printf("prompt:  %s\n", e.prompt ? e.prompt : "-");
     printf("file:    %s\n", e.path);
     bg_store_entry_clear(&e);
@@ -457,6 +497,28 @@ static int cmd_prune(int argc, char **argv) {
     return 0;
 }
 
+// List built-in + config providers and whether a key currently resolves.
+// Client-side only (reads config/env/key files); does not contact the daemon.
+static int cmd_providers(void) {
+    char **names = NULL;
+    size_t n = 0;
+    if (bg_provider_list_names(&names, &n) != 0) { LOG_ERR("providers: out of memory"); return 1; }
+    printf("%-12s %-10s %-4s %s\n", "PROVIDER", "SCHEME", "KEY", "MODEL  (base-url)");
+    for (size_t i = 0; i < n; i++) {
+        bg_provider p;
+        if (bg_provider_resolve(names[i], NULL, NULL, NULL, &p) == 0) {
+            printf("%-12s %-10s %-4s %s  (%s)\n", p.name, bg_scheme_to_string(p.scheme),
+                   p.api_key ? "yes" : "no", p.model, p.base_url);
+            bg_provider_clear(&p);
+        } else {
+            printf("%-12s %-10s\n", names[i], "(unresolved)");
+        }
+        free(names[i]);
+    }
+    free(names);
+    return 0;
+}
+
 // ---------- entry ----------
 
 int main(int argc, char **argv) {
@@ -473,6 +535,7 @@ int main(int argc, char **argv) {
     if (!strcmp(a1, "refine"))                       return cmd_refine(argc - 2, argv + 2);
     if (!strcmp(a1, "list"))                         return cmd_list();
     if (!strcmp(a1, "current"))                      return cmd_current();
+    if (!strcmp(a1, "providers"))                    return cmd_providers();
     if (!strcmp(a1, "restore") && argc >= 3)         return cmd_restore(argc - 2, argv + 2);
     if (!strcmp(a1, "outputs"))                      return cmd_outputs();
     if (!strcmp(a1, "prune"))                        return cmd_prune(argc - 2, argv + 2);

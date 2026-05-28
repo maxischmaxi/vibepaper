@@ -32,15 +32,23 @@ PROTO_SRCS := \
     $(PROTO_DIR)/viewporter-protocol.c
 PROTO_OBJS := $(PROTO_SRCS:.c=.o)
 
-SRCS := src/main.c src/wayland.c src/image.c src/openai.c src/ipc.c src/daemon.c src/store.c
+SRCS := src/main.c src/wayland.c src/image.c src/imagegen.c src/provider.c src/ipc.c src/daemon.c src/store.c
 OBJS := $(SRCS:.c=.o) $(PROTO_OBJS)
 
 BIN := vibepaper
 PREFIX ?= $(HOME)/.local
 
-.PHONY: all clean distclean install uninstall
+.PHONY: all clean distclean install uninstall test
 
 all: $(BIN)
+
+# Offline unit tests for the imagegen scheme builders/parsers, under ASan+UBSan
+# (the only way to catch latent UB like signed-shift overflow). No network/daemon.
+test: $(PROTO_HDRS)
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -o parse_test tests/parse_test.c \
+		$(shell pkg-config --libs libcjson libcurl) -lm
+	./parse_test
+	@rm -f parse_test
 
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
