@@ -6,7 +6,10 @@ iteratively refine them** via the OpenAI image API — plus set static images or
 solid colors, crossfade between them, keep a history you can restore from, and
 run on any of the four layers so it can coexist with an existing wallpaper tool.
 
+On Arch-based distros it's a one-liner from the AUR, then you're generating:
+
 ```sh
+yay -S vibepaper        # paru -S vibepaper, etc.
 vibepaper generate "a moody cyberpunk alley at night, rain, neon"
 ```
 
@@ -96,17 +99,22 @@ This produces the `vibepaper` binary. `make clean` removes objects;
 
 ### From the AUR (Arch / Hyprland / wlroots)
 
-Two packages are provided:
+The stable package is on the [AUR](https://aur.archlinux.org/packages/vibepaper) —
+install it with any helper:
 
-| Package         | Tracks                | Install              |
-| --------------- | --------------------- | -------------------- |
-| `vibepaper`     | latest tagged release | `yay -S vibepaper`     |
-| `vibepaper-git` | latest `main` commit  | `yay -S vibepaper-git` |
+```sh
+yay -S vibepaper        # paru -S vibepaper, etc.
+```
 
-Either pulls in the runtime deps (`wayland`, `curl`, `cjson`) and installs
-`/usr/bin/vibepaper` plus a systemd user service. To build a checkout by hand:
-`cd packaging && makepkg -si` (the `-git` PKGBUILD), or `packaging/stable/` for
-the release one.
+It pulls in the runtime dependencies (`wayland`, `curl`, `cjson`) automatically
+and installs `/usr/bin/vibepaper` plus a systemd user service. `base-devel` is
+the only assumed prerequisite (standard on Arch). New tagged releases land on the
+AUR automatically (see [Releasing](#releasing-maintainer)).
+
+For the bleeding edge there's a `vibepaper-git` PKGBUILD (tracks `main`) in
+`packaging/PKGBUILD` — build it with `cd packaging && makepkg -si`. It is **not**
+published to the AUR by default; push it there yourself if you want
+`yay -S vibepaper-git` (see `packaging/` and the publish notes).
 
 vibepaper is MIT-licensed (see `LICENSE`); the package installs it to
 `/usr/share/licenses/vibepaper/`.
@@ -195,6 +203,34 @@ By default this uses OpenAI's `gpt-image-2`. Switch the model with `--model`
 `2048x2048`, `2048x1152`, `3840x2160`, `2160x3840`.
 Qualities: `low`, `medium` (default), `high`, `auto`.
 (Other providers interpret size/quality differently — see below.)
+
+### Example prompts
+
+Stuck for inspiration? These make for great desktops (and a few make for great
+conversation starters):
+
+```sh
+# cinematic / aesthetic
+vibepaper generate "a lone astronaut sipping coffee on the rings of Saturn, vaporwave palette" --size 3840x2160
+vibepaper generate "bioluminescent jungle at midnight, glowing mushrooms, volumetric fog, cinematic"
+vibepaper generate "an ancient library inside a giant hollow tree, shafts of golden light, ultra detailed"
+vibepaper generate "synthwave sunset over a chrome city, a DeLorean on the grid, magenta and cyan"
+vibepaper generate "a lone samurai in a field of glowing blue flowers under two moons" --quality high
+
+# cozy / minimalist
+vibepaper generate "isometric cozy coffee shop in the rain, warm window light, Studio Ghibli vibes"
+vibepaper generate "minimalist layered mountains at dawn, paper-cut style, soft pastel gradients"
+
+# certified silly
+vibepaper generate "a corgi astronaut planting a flag on the moon, retro NASA travel poster"
+vibepaper generate "a raccoon DJ headlining a forest rave, tiny headphones, laser beams"
+vibepaper generate "pigeons in tiny suits holding a very serious rooftop board meeting, oil painting"
+vibepaper generate "a T-Rex attempting yoga at sunrise, watercolor, surprisingly serene"
+vibepaper generate "a cat CEO signing important documents with a quill, candlelit renaissance portrait"
+```
+
+Then keep iterating on whatever you like with `refine` (see below) — e.g.
+`vibepaper refine "now make it snow"`.
 
 ### Refining (iterating on an image)
 
