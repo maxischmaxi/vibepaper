@@ -96,20 +96,35 @@ This produces the `vibepaper` binary. `make clean` removes objects;
 
 ### From the AUR (Arch / Hyprland / wlroots)
 
-A `vibepaper-git` package is in `packaging/PKGBUILD`. To build and install it:
+Two packages are provided:
 
-```sh
-cd packaging
-makepkg -si
-```
+| Package         | Tracks                | Install              |
+| --------------- | --------------------- | -------------------- |
+| `vibepaper`     | latest tagged release | `yay -S vibepaper`     |
+| `vibepaper-git` | latest `main` commit  | `yay -S vibepaper-git` |
 
-This pulls the latest `main`, builds it and installs `/usr/bin/vibepaper` plus a
-systemd user service. Runtime dependencies (`wayland`, `curl`, `cjson`) are
-pulled in automatically. Once it is published on the AUR you will be able to
-`yay -S vibepaper-git` (or any AUR helper) directly.
+Either pulls in the runtime deps (`wayland`, `curl`, `cjson`) and installs
+`/usr/bin/vibepaper` plus a systemd user service. To build a checkout by hand:
+`cd packaging && makepkg -si` (the `-git` PKGBUILD), or `packaging/stable/` for
+the release one.
 
 vibepaper is MIT-licensed (see `LICENSE`); the package installs it to
 `/usr/share/licenses/vibepaper/`.
+
+### Releasing (maintainer)
+
+Pushing a version tag triggers `.github/workflows/release.yml`, which builds +
+tests in an Arch container, creates a GitHub Release, and publishes the stable
+`vibepaper` package to the AUR:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+One-time setup: an AUR account with the CI deploy **public** key added under
+*My Account → SSH Public Key*; the matching private key is stored base64-encoded
+in the repo secret `AUR_SSH_KEY`. The `-git` package is published separately
+(see `packaging/PKGBUILD`); `yay -Syu --devel` keeps `-git` installs current.
 
 ### From source
 

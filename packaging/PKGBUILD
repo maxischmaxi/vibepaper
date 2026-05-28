@@ -5,9 +5,9 @@
 
 pkgname=vibepaper-git
 _pkgname=vibepaper
-pkgver=0.1.0.r0.g0000000
+pkgver=0.1.0.r6.g53176d9   # placeholder; pkgver() recomputes from git at build time
 pkgrel=1
-pkgdesc="Wayland layer-shell wallpaper daemon that generates and refines wallpapers via the OpenAI image API"
+pkgdesc="Wayland wallpaper daemon that generates and refines wallpapers via OpenAI, Gemini, Stability and other image APIs"
 arch=('x86_64')
 url="https://github.com/maxischmaxi/vibepaper"
 license=('MIT')

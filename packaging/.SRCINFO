@@ -1,6 +1,6 @@
 pkgbase = vibepaper-git
-	pkgdesc = Wayland layer-shell wallpaper daemon that generates and refines wallpapers via the OpenAI image API
-	pkgver = 0.1.0.r0.g0000000
+	pkgdesc = Wayland wallpaper daemon that generates and refines wallpapers via OpenAI, Gemini, Stability and other image APIs
+	pkgver = 0.1.0.r6.g53176d9
 	pkgrel = 1
 	url = https://github.com/maxischmaxi/vibepaper
 	arch = x86_64

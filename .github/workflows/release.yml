@@ -1,0 +1,98 @@
+name: release
+
+# Tag-driven release: pushing a version tag (e.g. v0.1.0) builds + tests the
+# project, creates a GitHub Release, and publishes the stable `vibepaper`
+# package to the AUR (source = this tag's tarball + checksum).
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    permissions:
+      contents: write          # create the GitHub Release
+    steps:
+      # `run:` steps use the container's shell directly; only JS actions
+      # (actions/checkout) need node, so install it here first.
+      - name: Install toolchain
+        run: |
+          pacman -Syu --noconfirm --needed \
+            nodejs git openssh github-cli pacman-contrib \
+            wayland wayland-protocols cjson curl pkgconf
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare unprivileged build user
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      # Release gate: a broken tag must never reach users.
+      - name: Build
+        run: runuser -u builder -- make
+      - name: Test (ASan/UBSan offline unit tests)
+        run: runuser -u builder -- make test
+
+      - name: Stage stable PKGBUILD (version + checksums + .SRCINFO)
+        id: pkg
+        working-directory: packaging/stable
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          # Validate before substituting: a pacman pkgver is [alphanum . _ + ~],
+          # which also keeps the value free of sed-special chars (/ & \).
+          if ! printf '%s' "$VER" | grep -qE '^[0-9][0-9A-Za-z.+~_]*$'; then
+            echo "::error::Tag '$GITHUB_REF_NAME' is not a valid version (expected vX.Y.Z)"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          sed -i "s/^pkgver=.*/pkgver=$VER/" PKGBUILD
+          chown -R builder:builder .
+          # Download the just-pushed tag tarball, fill sha256sums, regenerate .SRCINFO,
+          # and verify the source integrity — all as the unprivileged user.
+          runuser -u builder -- updpkgsums
+          runuser -u builder -- bash -c 'makepkg --printsrcinfo' > .SRCINFO
+          runuser -u builder -- makepkg --verifysource --noconfirm
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+                 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+      - name: Publish to the AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_KEY" ]; then
+            echo "::warning::AUR_SSH_KEY secret not set — skipping AUR publish."
+            exit 0
+          fi
+          install -d -m700 ~/.ssh
+          # The secret stores the private key base64-encoded (robust against any
+          # newline/whitespace mangling); decode it back to the real key here.
+          printf '%s' "$AUR_SSH_KEY" | base64 -d > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes'
+          git clone ssh://aur@aur.archlinux.org/vibepaper.git aur
+          cp packaging/stable/PKGBUILD packaging/stable/.SRCINFO aur/
+          cd aur
+          git config user.name 'maxischmaxi'
+          git config user.email 'max@jeschek.dev'
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already up to date for this version."
+          else
+            git commit -m "vibepaper ${{ steps.pkg.outputs.version }}"
+            git push origin master
+          fi
