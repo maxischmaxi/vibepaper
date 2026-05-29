@@ -11,7 +11,10 @@ pkgdesc="Wayland wallpaper daemon that generates and refines wallpapers via Open
 arch=('x86_64')
 url="https://github.com/maxischmaxi/vibepaper"
 license=('MIT')
-depends=('wayland' 'curl' 'cjson')
+# wayland+wayland-protocols → wlr backend; libxcb → x11 backend;
+# glib2 → gnome backend (GSettings); dbus → kde backend. Build all four by
+# default (Makefile BACKENDS); the daemon picks one at runtime.
+depends=('wayland' 'curl' 'cjson' 'libxcb' 'glib2' 'dbus')
 makedepends=('git' 'wayland-protocols' 'pkgconf')
 provides=("$_pkgname")
 conflicts=("$_pkgname")

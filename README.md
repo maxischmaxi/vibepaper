@@ -1,10 +1,12 @@
 # vibepaper
 
-A Wayland wallpaper daemon for `wlr-layer-shell` compositors (Hyprland, Sway,
-river, …) that can **generate wallpapers on the fly from a text prompt — and
-iteratively refine them** via the OpenAI image API — plus set static images or
-solid colors, crossfade between them, keep a history you can restore from, and
-run on any of the four layers so it can coexist with an existing wallpaper tool.
+A Linux wallpaper daemon that can **generate wallpapers on the fly from a text
+prompt — and iteratively refine them** via the OpenAI image API — plus set
+static images or solid colors, keep a history you can restore from, and crossfade
+between them. It runs on **multiple display systems** through pluggable backends:
+`wlr-layer-shell` compositors (Hyprland, Sway, river, …), plain **X11**, and
+**GNOME** and **KDE Plasma** sessions. The right backend is picked automatically
+(see [Display backends](#display-backends)).
 
 On Arch-based distros it's a one-liner from the AUR, then you're generating:
 
@@ -19,9 +21,12 @@ vibepaper generate "a moody cyberpunk alley at night, rain, neon"
 
 `vibepaper` is a single binary with two roles:
 
-- **Daemon** (`vibepaper daemon`) — connects to the compositor, creates a
-  `wlr-layer-shell` surface on every output, and renders the wallpaper into a
-  shared-memory (`wl_shm`) buffer. It listens on a UNIX socket for commands.
+- **Daemon** (`vibepaper daemon`) — selects a display backend for the current
+  session (see [Display backends](#display-backends)) and uses it to put the
+  wallpaper on screen. On `wlr-layer-shell` it renders into a shared-memory
+  (`wl_shm`) surface on every output; on X11 it paints the root pixmap; on
+  GNOME/KDE it hands the image to the desktop environment. It listens on a UNIX
+  socket for commands.
 - **Client** (every other invocation) — sends one JSON command to the daemon
   over that socket and prints the result. If no daemon is running, the client
   forks one automatically before sending.
@@ -61,19 +66,63 @@ Key design points:
 
 ### Source layout
 
-| File            | Responsibility                                             |
-| --------------- | ---------------------------------------------------------- |
-| `src/main.c`    | CLI parsing, client requests, daemon auto-spawn            |
-| `src/daemon.c`  | Event loop, command dispatch, generation queue + worker    |
-| `src/wayland.c` | Layer-shell surfaces, SHM buffer pool, crossfade, viewport |
-| `src/imagegen.c`| Provider-agnostic image generate/edit; `openai`/`gemini`/`stability` wire schemes (libcurl + cJSON + b64) |
-| `src/provider.c`| Provider presets, JSON config, per-provider API-key resolution |
-| `src/image.c`   | Decode / cover-fit / blit (stb)                            |
-| `src/store.c`   | History store (save, list, restore, prune)                 |
-| `src/ipc.c`     | UNIX-socket JSON line protocol                             |
-| `tests/`        | Offline unit tests for the scheme builders/parsers (`make test`) |
-| `protocols/`    | Vendored `wlr-layer-shell` XML + generated glue            |
-| `third_party/`  | Vendored `stb_image` / `stb_image_resize2`                 |
+| File               | Responsibility                                          |
+| ------------------ | ------------------------------------------------------- |
+| `src/main.c`       | CLI parsing, client requests, daemon auto-spawn         |
+| `src/daemon.c`     | Event loop, command dispatch, generation queue + worker |
+| `src/display.{h,c}`| Display-backend interface + runtime backend selection   |
+| `src/backend.h`    | Internal vtable each backend implements                 |
+| `src/backend_wlr.c`| wlr-layer-shell backend: SHM surfaces, crossfade, viewport |
+| `src/backend_x11.c`| X11 backend: root pixmap + XRandR (xcb)                 |
+| `src/backend_gnome.c`| GNOME backend: GSettings (GIO), delegate to the DE    |
+| `src/backend_kde.c`| KDE Plasma backend: D-Bus `evaluateScript`, delegate    |
+| `src/imagegen.c`   | Provider-agnostic image generate/edit; `openai`/`gemini`/`stability` wire schemes (libcurl + cJSON + b64) |
+| `src/provider.c`   | Provider presets, JSON config, per-provider API-key resolution |
+| `src/image.c`      | Decode / cover-fit / blit (stb)                         |
+| `src/store.c`      | History store (save, list, restore, prune)              |
+| `src/ipc.c`        | UNIX-socket JSON line protocol                          |
+| `tests/`           | Offline unit tests for the scheme builders/parsers (`make test`) |
+| `protocols/`       | Vendored `wlr-layer-shell` XML + generated glue         |
+| `third_party/`     | Vendored `stb_image` / `stb_image_resize2`              |
+
+---
+
+## Display backends
+
+`vibepaper` renders through one of four backends, chosen automatically at daemon
+startup. Two **own the pixels** and animate crossfades themselves; two **delegate**
+a static image to the desktop environment (which runs its own transition):
+
+| Backend | Used on | Crossfade | Per-output (`--output`) | `VIBEPAPER_LAYER` |
+| ------- | ------- | --------- | ----------------------- | ----------------- |
+| `wlr`   | wlr-layer-shell compositors (Hyprland, Sway, river, …) | yes | yes | yes |
+| `x11`   | any X11 window manager | not yet¹ | yes | — |
+| `gnome` | GNOME (Mutter), Wayland or X11 | DE-controlled | no² | — |
+| `kde`   | KDE Plasma, Wayland or X11 | DE-controlled | no²ʼ³ | — |
+
+¹ The X11 backend currently swaps instantly; a timer-driven crossfade is planned.
+² GNOME/KDE expose no API for a third-party process to draw the background, so
+  vibepaper hands the desktop environment a file/color and it does the transition.
+  `--output` returns a clear "not supported" error on these backends.
+³ KDE applies the wallpaper to every desktop; per-screen support is a follow-up.
+
+**Selection.** At startup the daemon picks the first backend that fits:
+
+1. `wlr` — a Wayland session whose compositor implements `zwlr_layer_shell_v1`.
+2. `gnome` / `kde` — `$XDG_CURRENT_DESKTOP` names GNOME or KDE (Wayland or X11).
+3. `x11` — a plain X11 server (only when **no** Wayland session is present; an X11
+   wallpaper drawn under XWayland would be invisible on a GNOME/KDE Wayland desktop).
+
+Override the choice with `VIBEPAPER_BACKEND=wlr|x11|gnome|kde` (e.g. to force the
+`x11` root-pixmap backend inside a GNOME-on-X11 session).
+
+**Build only some backends.** Each is independently selectable at build time:
+
+```sh
+make BACKENDS="wlr x11"     # skip the GNOME/KDE backends (no glib2/dbus needed)
+```
+
+The default builds all four.
 
 ---
 
@@ -82,8 +131,13 @@ Key design points:
 Dependencies (Arch package names):
 
 ```sh
-sudo pacman -S --needed wayland wayland-protocols cjson curl base-devel
+sudo pacman -S --needed wayland wayland-protocols cjson curl base-devel \
+                        libxcb glib2 dbus
 ```
+
+`wayland`/`wayland-protocols` are for the `wlr` backend, `libxcb` for `x11`,
+`glib2` for `gnome` (GSettings) and `dbus` for `kde`. You only need the deps of
+the backends you actually build (see `BACKENDS` above).
 
 `stb` and the `wlr-layer-shell` protocol are vendored in the repo, so no AUR
 packages are needed. Then:
@@ -504,11 +558,12 @@ Read by the **daemon** at startup (set them before the command that spawns it):
 | Variable               | Default      | Meaning                                                             |
 | ---------------------- | ------------ | ------------------------------------------------------------------- |
 | `VIBEPAPER_PROVIDER`   | `openai`     | Default provider when `--provider` is omitted (config wins over this). |
+| `VIBEPAPER_BACKEND`    | auto         | Force a display backend: `wlr`, `x11`, `gnome`, `kde` (see [Display backends](#display-backends)). |
 | `OPENAI_API_KEY`       | —            | API key for the `openai` provider (see [Providers](#providers)).    |
 | `GEMINI_API_KEY` etc.  | —            | Per-provider key env vars (`STABILITY_API_KEY`, `XAI_API_KEY`, …).  |
 | `OPENAI_API_KEY_FILE`  | —            | Legacy: path to a file whose first line is the OpenAI key.          |
-| `VIBEPAPER_LAYER`      | `background` | Layer to render on: `background`, `bottom`, `top`, `overlay`.       |
-| `VIBEPAPER_FADE_MS`    | `400`        | Crossfade duration in ms. `0` disables fades.                       |
+| `VIBEPAPER_LAYER`      | `background` | **`wlr` backend only.** Layer to render on: `background`, `bottom`, `top`, `overlay`. |
+| `VIBEPAPER_FADE_MS`    | `400`        | **`wlr` backend only.** Crossfade duration in ms. `0` disables fades. (GNOME/KDE run their own transition; X11 swaps instantly.) |
 | `XDG_CACHE_HOME`       | `~/.cache`   | History lives in `$XDG_CACHE_HOME/vibepaper`.                       |
 | `XDG_CONFIG_HOME`      | `~/.config`  | `config.json` + keys live in `$XDG_CONFIG_HOME/vibepaper`.          |
 | `XDG_RUNTIME_DIR`      | —            | Daemon socket lives here (`vibepaper.sock`); falls back to `/tmp`.  |
@@ -536,11 +591,14 @@ chmod 600 ~/.config/vibepaper/api_key
   client blocks until its turn completes.
 - Image generation is non-deterministic — there is no dedup cache. Use `restore`
   to re-display a past wallpaper for free instead of regenerating.
-- During a crossfade on a 4K output the wallpaper is briefly soft (half-res
-  blend) and snaps to full resolution at the end. Raise the `HALFRES_ABOVE`
-  threshold in `src/wayland.c`, or set `VIBEPAPER_FADE_MS=0`, to avoid this.
-- Requires a compositor implementing `wlr-layer-shell`. `wp_viewporter` is
-  optional; without it, crossfades run at full resolution.
+- During a crossfade on a 4K output (`wlr` backend) the wallpaper is briefly soft
+  (half-res blend) and snaps to full resolution at the end. Raise the
+  `HALFRES_ABOVE` threshold in `src/backend_wlr.c`, or set `VIBEPAPER_FADE_MS=0`,
+  to avoid this.
+- Runs on wlr-layer-shell compositors, X11, GNOME and KDE via auto-selected
+  backends (see [Display backends](#display-backends)); each has different
+  crossfade / per-output capabilities. On the `wlr` backend `wp_viewporter` is
+  optional — without it, crossfades run at full resolution.
 
 ### Security model
 
@@ -571,7 +629,8 @@ Contributions are welcome — bug fixes, new providers, rendering tweaks, docs.
 ### Set up
 
 ```sh
-sudo pacman -S --needed base-devel wayland wayland-protocols cjson curl pkgconf
+sudo pacman -S --needed base-devel wayland wayland-protocols cjson curl pkgconf \
+                        libxcb glib2 dbus
 git clone https://github.com/maxischmaxi/vibepaper
 cd vibepaper
 make          # builds ./vibepaper

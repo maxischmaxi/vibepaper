@@ -25,7 +25,8 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             nodejs git openssh github-cli pacman-contrib \
-            wayland wayland-protocols cjson curl pkgconf
+            wayland wayland-protocols cjson curl pkgconf \
+            libxcb glib2 dbus
 
       - uses: actions/checkout@v4
 

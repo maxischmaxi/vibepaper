@@ -4,13 +4,13 @@
 // the main poll loop watches; all Wayland calls stay on the main thread.
 
 #include "daemon.h"
+#include "display.h"
 #include "image.h"
 #include "imagegen.h"
 #include "ipc.h"
 #include "log.h"
 #include "provider.h"
 #include "store.h"
-#include "wayland.h"
 
 #include <cJSON.h>
 
@@ -59,7 +59,8 @@ typedef struct {
 } gen_job;
 
 typedef struct {
-    bg_wayland *w;
+    bg_display *disp;
+    unsigned   caps;    // bg_display_caps() of the selected backend (BG_CAP_*)
     int   listen_fd;
     int   gen_evfd;     // eventfd, worker → main loop completion signal
     gen_job job;
@@ -116,15 +117,17 @@ static int parse_hex_color(const char *s, uint32_t *out) {
 }
 
 // Route a source to a single output (out != NULL) or to all outputs.
-static bool apply_source(bg_wayland *w, const char *out, const bg_source *src) {
-    return out ? bg_wayland_set_source_output(w, out, src)
-               : bg_wayland_set_source(w, src);
+static bool apply_source(bg_display *w, const char *out, const bg_source *src) {
+    return out ? bg_display_set_source_output(w, out, src)
+               : bg_display_set_source(w, src);
 }
 
-static bool apply_image_path(bg_wayland *w, const char *out, const char *path) {
+static bool apply_image_path(bg_display *w, const char *out, const char *path) {
     bg_image img = {0};
     if (!bg_image_load_file(path, &img)) return false;
-    bg_source src = { .kind = BG_SRC_IMAGE, .image = img };
+    // Pass the on-disk path along too: delegate backends (GNOME/KDE) hand it
+    // straight to the desktop environment instead of rendering the pixels.
+    bg_source src = { .kind = BG_SRC_IMAGE, .image = img, .file_path = path };
     bool ok = apply_source(w, out, &src);
     bg_image_free(&img);
     return ok;
@@ -295,8 +298,14 @@ static void gen_complete(daemon_ctx *ctx) {
             reply_err(cfd, "openai: response not decodable as image");
         } else {
             LOG_INFO("generate: rendered image %dx%d", img.width, img.height);
+            // Hand delegate backends the freshly-saved cache file (live backends
+            // ignore file_path and render the decoded pixels instead).
+            char src_path[BG_PATH_MAX];
             bg_source src = { .kind = BG_SRC_IMAGE, .image = img };
-            bool ok = apply_source(ctx->w, j->req.output, &src);
+            if (id[0] && bg_store_path(id, j->res.ext ? j->res.ext : "png",
+                                       src_path, sizeof(src_path)) == 0)
+                src.file_path = src_path;
+            bool ok = apply_source(ctx->disp, j->req.output, &src);
             bg_image_free(&img);
             if (ok) {
                 if (id[0] && !j->req.output) bg_store_set_current(id);
@@ -369,7 +378,7 @@ static int resolve_provider_or_reply(int client_fd, const char *cmd,
 
 // Returns true if client_fd was handed to an async job (caller must NOT close).
 static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
-    bg_wayland *w = ctx->w;
+    bg_display *w = ctx->disp;
     cJSON *root = cJSON_Parse(line);
     if (!root) { reply_err(client_fd, "invalid json"); return false; }
 
@@ -382,6 +391,16 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
     // Optional target output; NULL → all outputs.
     const cJSON *outv = cJSON_GetObjectItem(root, "output");
     const char *out = cJSON_IsString(outv) ? outv->valuestring : NULL;
+
+    // Per-output targeting needs a backend that owns the pixels per monitor.
+    // Delegate backends (GNOME/KDE) hand a single image to the desktop
+    // environment, so reject --output there with a clear message.
+    if (out && !(ctx->caps & BG_CAP_PER_OUTPUT)) {
+        reply_err(client_fd, "this backend does not support per-output "
+                  "(--output) wallpapers");
+        cJSON_Delete(root);
+        return false;
+    }
 
     if (strcmp(c, "stop") == 0) {
         reply_ok(client_fd);
@@ -493,7 +512,7 @@ static bool handle_command(daemon_ctx *ctx, int client_fd, const char *line) {
     } else if (strcmp(c, "outputs") == 0) {
         char **names = NULL;
         size_t n = 0;
-        if (bg_wayland_output_names(w, &names, &n) != 0) {
+        if (bg_display_output_names(w, &names, &n) != 0) {
             reply_err(client_fd, "outputs: query failed");
         } else {
             cJSON *o = cJSON_CreateObject();
@@ -526,17 +545,18 @@ int bg_daemon_run(void) {
     ctx.running = true;
     ctx.job.req.client_fd = -1;
 
-    ctx.w = bg_wayland_init();
-    if (!ctx.w) { bg_imagegen_global_cleanup(); return 1; }
+    ctx.disp = bg_display_init();
+    if (!ctx.disp) { bg_imagegen_global_cleanup(); return 1; }
+    ctx.caps = bg_display_caps(ctx.disp);
 
     ctx.listen_fd = bg_ipc_server_listen();
-    if (ctx.listen_fd < 0) { bg_wayland_destroy(ctx.w); bg_imagegen_global_cleanup(); return 1; }
+    if (ctx.listen_fd < 0) { bg_display_destroy(ctx.disp); bg_imagegen_global_cleanup(); return 1; }
 
     ctx.gen_evfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (ctx.gen_evfd < 0) {
         LOG_ERR("eventfd: %s", strerror(errno));
         close(ctx.listen_fd);
-        bg_wayland_destroy(ctx.w);
+        bg_display_destroy(ctx.disp);
         bg_imagegen_global_cleanup();
         return 1;
     }
@@ -552,34 +572,46 @@ int bg_daemon_run(void) {
         bg_store_entry e;
         if (bg_store_get(cur_id, &e) == 0) {
             LOG_INFO("restoring last wallpaper %s", e.id);
-            apply_image_path(ctx.w, NULL, e.path);
+            apply_image_path(ctx.disp, NULL, e.path);
             bg_store_entry_clear(&e);
         }
     }
 
     int client_fd = -1;
 
-    while (ctx.running && !g_signaled && !bg_wayland_should_exit(ctx.w)) {
-        bg_wayland_flush(ctx.w);
+    while (ctx.running && !g_signaled && !bg_display_should_exit(ctx.disp)) {
+        bg_display_flush(ctx.disp);
 
+        // The display backend's fd is optional: live backends (wlr, x11) expose
+        // a connection fd, delegate backends (gnome, kde) return -1 and have
+        // nothing to poll.
         struct pollfd fds[4];
         int nfds = 0;
-        int idx_wl  = nfds; fds[nfds++] = (struct pollfd){ .fd = bg_wayland_fd(ctx.w), .events = POLLIN };
-        int idx_lis = nfds; fds[nfds++] = (struct pollfd){ .fd = ctx.listen_fd,        .events = POLLIN };
-        int idx_gen = nfds; fds[nfds++] = (struct pollfd){ .fd = ctx.gen_evfd,         .events = POLLIN };
+        int idx_disp = -1;
+        int disp_fd = bg_display_fd(ctx.disp);
+        if (disp_fd >= 0) { idx_disp = nfds; fds[nfds++] = (struct pollfd){ .fd = disp_fd, .events = POLLIN }; }
+        int idx_lis = nfds; fds[nfds++] = (struct pollfd){ .fd = ctx.listen_fd, .events = POLLIN };
+        int idx_gen = nfds; fds[nfds++] = (struct pollfd){ .fd = ctx.gen_evfd,  .events = POLLIN };
         int idx_cli = -1;
         if (client_fd >= 0) { idx_cli = nfds; fds[nfds++] = (struct pollfd){ .fd = client_fd, .events = POLLIN }; }
 
-        int pr = poll(fds, nfds, 1000);
+        // Let a timer-driven backend (e.g. an X11 crossfade) shorten the wait;
+        // -1 / oversized values fall back to the 1s idle heartbeat.
+        int bt = bg_display_timeout_ms(ctx.disp);
+        int timeout = (bt < 0 || bt > 1000) ? 1000 : bt;
+
+        int pr = poll(fds, nfds, timeout);
         if (pr < 0) {
             if (errno == EINTR) continue;
             LOG_ERR("poll: %s", strerror(errno));
             break;
         }
 
-        if (fds[idx_wl].revents & POLLIN) {
-            if (bg_wayland_dispatch(ctx.w) < 0) { LOG_ERR("wayland dispatch failed"); break; }
+        if (idx_disp >= 0 && (fds[idx_disp].revents & POLLIN)) {
+            if (bg_display_dispatch(ctx.disp) < 0) { LOG_ERR("display dispatch failed"); break; }
         }
+        // Advance any timer-driven animation (no-op for backends that don't need it).
+        bg_display_tick(ctx.disp);
         if (fds[idx_gen].revents & POLLIN) {
             gen_complete(&ctx);
         }
@@ -635,7 +667,7 @@ int bg_daemon_run(void) {
     char path[PATH_MAX];
     if (bg_ipc_socket_path(path, sizeof(path)) == 0) unlink(path);
 
-    bg_wayland_destroy(ctx.w);
+    bg_display_destroy(ctx.disp);
     bg_imagegen_global_cleanup();
     LOG_INFO("daemon shutdown");
     return 0;

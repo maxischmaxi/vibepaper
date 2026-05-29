@@ -66,6 +66,13 @@ int bg_store_init(void) {
 
 const char *bg_store_dir(void) { return g_dir; }
 
+int bg_store_path(const char *id, const char *ext, char *out, size_t out_len) {
+    if (bg_store_init() < 0) return -1;
+    int n = snprintf(out, out_len, "%s/%s.%s", g_dir, id, ext ? ext : "png");
+    if (n < 0 || (size_t)n >= out_len) return -1;
+    return 0;
+}
+
 // ---------- helpers ----------
 
 static int write_file(const char *path, const void *data, size_t len) {

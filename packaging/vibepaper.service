@@ -3,8 +3,11 @@ Description=vibepaper Wayland wallpaper daemon
 Documentation=https://github.com/maxischmaxi/vibepaper
 PartOf=graphical-session.target
 After=graphical-session.target
-# Only start inside a Wayland session (the daemon needs WAYLAND_DISPLAY).
-ConditionEnvironment=WAYLAND_DISPLAY
+# Start inside any graphical session: a Wayland one (wlr/GNOME/KDE backends need
+# WAYLAND_DISPLAY) or an X11 one (x11/GNOME/KDE backends need DISPLAY). The `|`
+# makes these triggering conditions, so the unit starts if EITHER is set.
+ConditionEnvironment=|WAYLAND_DISPLAY
+ConditionEnvironment=|DISPLAY
 
 [Service]
 Type=simple

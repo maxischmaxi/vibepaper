@@ -27,6 +27,11 @@ int bg_store_init(void);
 // Absolute path to the cache directory (valid after bg_store_init).
 const char *bg_store_dir(void);
 
+// Compose the absolute on-disk path of an image file from its id and extension
+// ("<cache-dir>/<id>.<ext>", the layout bg_store_add writes). Returns 0 / -1
+// (no cache dir or path too long for `out`).
+int bg_store_path(const char *id, const char *ext, char *out, size_t out_len);
+
 // Persist image bytes + metadata. `ext` is the file extension without dot
 // ("png", "jpg", "webp"). A timestamp-based id is written into out_id.
 // Returns 0 / -1.

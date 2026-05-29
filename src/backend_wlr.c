@@ -1,4 +1,6 @@
-// Wayland layer-shell client with memory-cheap crossfade transitions.
+// wlr-layer-shell display backend, with memory-cheap crossfade transitions.
+// One of the backends behind the bg_display interface (see display.h); selected
+// on compositors that implement zwlr_layer_shell_v1 (Hyprland, Sway, river, …).
 //
 // The current source (image/color) is the single source of truth; we do not
 // keep a full-resolution copy of the displayed pixels around. On a source
@@ -11,7 +13,8 @@
 // commit the final frame at full resolution for sharpness. A per-output 2-slot
 // buffer pool avoids allocating an SHM buffer every frame; idle slots are freed.
 
-#include "wayland.h"
+#include "backend.h"
+#include "display.h"
 #include "image.h"
 #include "log.h"
 
@@ -27,11 +30,15 @@
 #include <unistd.h>
 #include <wayland-client.h>
 
+#ifdef BG_BACKEND_WLR
+
 #define POOL_SIZE       2
 #define DEFAULT_FADE_MS 400
 #define HALFRES_ABOVE   (1920L * 1080)   // blend at half-res for outputs larger than this
 
 struct bg_output_state;
+
+typedef struct bg_wayland bg_wayland;
 
 struct bg_wayland {
     struct wl_display *display;
@@ -494,9 +501,11 @@ static const struct wl_registry_listener registry_listener = {
     .global_remove = registry_global_remove,
 };
 
-// ---------- public API ----------
+// ---------- backend ops ----------
 
-bg_wayland *bg_wayland_init(void) {
+static void wlr_destroy(void *st);
+
+static void *wlr_init(void) {
     bg_wayland *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
 
@@ -529,14 +538,14 @@ bg_wayland *bg_wayland_init(void) {
     if (!w->compositor || !w->shm || !w->layer_shell) {
         LOG_ERR("missing required globals (compositor=%p shm=%p layer_shell=%p)",
                 (void *)w->compositor, (void *)w->shm, (void *)w->layer_shell);
-        bg_wayland_destroy(w);
+        wlr_destroy(w);
         return NULL;
     }
     if (!w->viewporter)
         LOG_WARN("wp_viewporter unavailable — crossfades run at full resolution");
     if (!w->outputs) {
         LOG_ERR("no wl_outputs available");
-        bg_wayland_destroy(w);
+        wlr_destroy(w);
         return NULL;
     }
     for (bg_output_state *o = w->outputs; o; o = o->next) output_setup_layer(o);
@@ -544,7 +553,8 @@ bg_wayland *bg_wayland_init(void) {
     return w;
 }
 
-void bg_wayland_destroy(bg_wayland *w) {
+static void wlr_destroy(void *st) {
+    bg_wayland *w = st;
     if (!w) return;
     while (w->outputs) {
         bg_output_state *o = w->outputs;
@@ -561,9 +571,13 @@ void bg_wayland_destroy(bg_wayland *w) {
     free(w);
 }
 
-void bg_wayland_set_fade_ms(bg_wayland *w, unsigned ms) { w->fade_ms = ms; }
+static void wlr_set_fade_ms(void *st, unsigned ms) {
+    bg_wayland *w = st;
+    w->fade_ms = ms;
+}
 
-bool bg_wayland_set_source(bg_wayland *w, const bg_source *src) {
+static bool wlr_set_source(void *st, const bg_source *src) {
+    bg_wayland *w = st;
     // Start transitions first (they read the current source as "old"), then
     // commit the new source as the global one and drop per-output overrides.
     for (bg_output_state *o = w->outputs; o; o = o->next)
@@ -580,8 +594,9 @@ bool bg_wayland_set_source(bg_wayland *w, const bg_source *src) {
     return true;
 }
 
-bool bg_wayland_set_source_output(bg_wayland *w, const char *output_name,
+static bool wlr_set_source_output(void *st, const char *output_name,
                                   const bg_source *src) {
+    bg_wayland *w = st;
     bg_output_state *target = NULL;
     for (bg_output_state *o = w->outputs; o; o = o->next)
         if (o->name && strcmp(o->name, output_name) == 0) { target = o; break; }
@@ -596,7 +611,8 @@ bool bg_wayland_set_source_output(bg_wayland *w, const char *output_name,
     return true;
 }
 
-int bg_wayland_output_names(bg_wayland *w, char ***names, size_t *count) {
+static int wlr_output_names(void *st, char ***names, size_t *count) {
+    bg_wayland *w = st;
     size_t n = 0;
     for (bg_output_state *o = w->outputs; o; o = o->next) n++;
     char **arr = calloc(n ? n : 1, sizeof(char *));
@@ -609,7 +625,60 @@ int bg_wayland_output_names(bg_wayland *w, char ***names, size_t *count) {
     return 0;
 }
 
-int  bg_wayland_fd(bg_wayland *w)          { return wl_display_get_fd(w->display); }
-int  bg_wayland_flush(bg_wayland *w)       { return wl_display_flush(w->display); }
-int  bg_wayland_dispatch(bg_wayland *w)    { return wl_display_dispatch(w->display); }
-bool bg_wayland_should_exit(bg_wayland *w) { return w->closed; }
+static int  wlr_fd(void *st)          { bg_wayland *w = st; return wl_display_get_fd(w->display); }
+static int  wlr_flush(void *st)       { bg_wayland *w = st; return wl_display_flush(w->display); }
+static int  wlr_dispatch(void *st)    { bg_wayland *w = st; return wl_display_dispatch(w->display); }
+static bool wlr_should_exit(void *st) { bg_wayland *w = st; return w->closed; }
+
+// ---------- probe ----------
+
+// Cheap "can this backend run here?" check: connect, see whether the compositor
+// advertises zwlr_layer_shell_v1, disconnect. No surfaces/buffers are created.
+struct wlr_probe_data { bool has_layer_shell; };
+
+static void wlr_probe_global(void *data, struct wl_registry *reg, uint32_t name,
+                             const char *iface, uint32_t version) {
+    (void)reg; (void)name; (void)version;
+    struct wlr_probe_data *p = data;
+    if (strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) p->has_layer_shell = true;
+}
+static void wlr_probe_global_remove(void *data, struct wl_registry *reg, uint32_t name) {
+    (void)data; (void)reg; (void)name;
+}
+static const struct wl_registry_listener wlr_probe_listener = {
+    .global = wlr_probe_global, .global_remove = wlr_probe_global_remove,
+};
+
+static bool wlr_probe(void) {
+    const char *wd = getenv("WAYLAND_DISPLAY");
+    if (!wd || !*wd) return false;
+    struct wl_display *dpy = wl_display_connect(NULL);
+    if (!dpy) return false;
+    struct wlr_probe_data pd = {0};
+    struct wl_registry *reg = wl_display_get_registry(dpy);
+    wl_registry_add_listener(reg, &wlr_probe_listener, &pd);
+    wl_display_roundtrip(dpy);
+    wl_registry_destroy(reg);
+    wl_display_disconnect(dpy);
+    return pd.has_layer_shell;
+}
+
+const bg_display_ops bg_backend_wlr = {
+    .name              = "wlr",
+    .caps              = BG_CAP_PER_OUTPUT | BG_CAP_CROSSFADE | BG_CAP_LAYER,
+    .probe             = wlr_probe,
+    .init              = wlr_init,
+    .destroy           = wlr_destroy,
+    .set_fade_ms       = wlr_set_fade_ms,
+    .set_source        = wlr_set_source,
+    .set_source_output = wlr_set_source_output,
+    .output_names      = wlr_output_names,
+    .fd                = wlr_fd,
+    .flush             = wlr_flush,
+    .dispatch          = wlr_dispatch,
+    .tick              = NULL,
+    .timeout_ms        = NULL,
+    .should_exit       = wlr_should_exit,
+};
+
+#endif // BG_BACKEND_WLR

@@ -1,38 +1,76 @@
 CC      ?= cc
-PKG      = wayland-client libcjson libcurl
+
+# Display backends to build in. Each is independently selectable; the daemon
+# picks one at runtime (see src/display.c). Override on the command line, e.g.
+#   make BACKENDS="wlr x11"
+BACKENDS ?= wlr x11 gnome kde
+
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -Werror=implicit-function-declaration \
            -D_GNU_SOURCE -pthread \
-           -Isrc -Iprotocols -Ithird_party \
-           $(shell pkg-config --cflags $(PKG))
-LDLIBS  := $(shell pkg-config --libs $(PKG)) -lm -lrt -pthread
+           -Isrc -Iprotocols -Ithird_party
+
+# Backend-agnostic core (always built).
+SRCS := src/main.c src/display.c src/image.c src/imagegen.c \
+        src/provider.c src/ipc.c src/daemon.c src/store.c
+PKG  := libcjson libcurl
 
 WAYLAND_SCANNER := $(shell pkg-config --variable=wayland_scanner wayland-scanner 2>/dev/null)
 ifeq ($(WAYLAND_SCANNER),)
 WAYLAND_SCANNER := wayland-scanner
 endif
+WP_DIR    := $(shell pkg-config --variable=pkgdatadir wayland-protocols 2>/dev/null)
+PROTO_DIR := protocols
 
-WP_DIR := $(shell pkg-config --variable=pkgdatadir wayland-protocols)
+# Generated protocol glue is only needed when the wlr backend is built.
+PROTO_HDRS :=
+PROTO_SRCS :=
 
-PROTO_DIR  := protocols
+# ---- per-backend selection ----
 
-# (xml, generated_basename) pairs.
+ifneq ($(filter wlr,$(BACKENDS)),)
+  CFLAGS += -DBG_BACKEND_WLR
+  PKG    += wayland-client
+  SRCS   += src/backend_wlr.c
+  PROTO_HDRS += \
+      $(PROTO_DIR)/wlr-layer-shell-unstable-v1-client-protocol.h \
+      $(PROTO_DIR)/xdg-shell-client-protocol.h \
+      $(PROTO_DIR)/viewporter-client-protocol.h
+  PROTO_SRCS += \
+      $(PROTO_DIR)/wlr-layer-shell-unstable-v1-protocol.c \
+      $(PROTO_DIR)/xdg-shell-protocol.c \
+      $(PROTO_DIR)/viewporter-protocol.c
+endif
+
+ifneq ($(filter x11,$(BACKENDS)),)
+  CFLAGS += -DBG_BACKEND_X11
+  PKG    += xcb xcb-randr xcb-shm
+  SRCS   += src/backend_x11.c
+endif
+
+ifneq ($(filter gnome,$(BACKENDS)),)
+  CFLAGS += -DBG_BACKEND_GNOME
+  PKG    += gio-2.0
+  SRCS   += src/backend_gnome.c
+endif
+
+ifneq ($(filter kde,$(BACKENDS)),)
+  CFLAGS += -DBG_BACKEND_KDE
+  PKG    += dbus-1
+  SRCS   += src/backend_kde.c
+endif
+
+# pkg-config flags depend on the fully-assembled PKG list, so resolve them last.
+CFLAGS  += $(shell pkg-config --cflags $(PKG))
+LDLIBS  := $(shell pkg-config --libs $(PKG)) -lm -lrt -pthread
+
+# (xml, generated_basename) pairs for the wlr backend.
 LAYER_XML := $(PROTO_DIR)/wlr-layer-shell-unstable-v1.xml
 XDG_XML   := $(WP_DIR)/stable/xdg-shell/xdg-shell.xml
 VP_XML    := $(WP_DIR)/stable/viewporter/viewporter.xml
 
-PROTO_HDRS := \
-    $(PROTO_DIR)/wlr-layer-shell-unstable-v1-client-protocol.h \
-    $(PROTO_DIR)/xdg-shell-client-protocol.h \
-    $(PROTO_DIR)/viewporter-client-protocol.h
-PROTO_SRCS := \
-    $(PROTO_DIR)/wlr-layer-shell-unstable-v1-protocol.c \
-    $(PROTO_DIR)/xdg-shell-protocol.c \
-    $(PROTO_DIR)/viewporter-protocol.c
 PROTO_OBJS := $(PROTO_SRCS:.c=.o)
-
-SRCS := src/main.c src/wayland.c src/image.c src/imagegen.c src/provider.c src/ipc.c src/daemon.c src/store.c
 OBJS := $(SRCS:.c=.o) $(PROTO_OBJS)
 
 BIN := vibepaper
@@ -44,7 +82,7 @@ all: $(BIN)
 
 # Offline unit tests for the imagegen scheme builders/parsers, under ASan+UBSan
 # (the only way to catch latent UB like signed-shift overflow). No network/daemon.
-test: $(PROTO_HDRS)
+test:
 	$(CC) $(CFLAGS) -fsanitize=address,undefined -o parse_test tests/parse_test.c \
 		$(shell pkg-config --libs libcjson libcurl) -lm
 	./parse_test
@@ -60,7 +98,9 @@ uninstall:
 $(BIN): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-# Source files depend on the generated protocol headers so the build order is correct.
+# Source files depend on the generated protocol headers so the build order is
+# correct. When the wlr backend is disabled PROTO_HDRS is empty and this is a
+# plain "object depends on source" rule.
 src/%.o: src/%.c $(PROTO_HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
